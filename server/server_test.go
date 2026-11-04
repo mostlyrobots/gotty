@@ -288,3 +288,70 @@ func TestMultiInterfaceBinding_AddressTrimming(t *testing.T) {
 	cancel()
 	<-errCh
 }
+
+func TestBasicAuthAndJSEscaping(t *testing.T) {
+	srv, err := New(&mockFactory{}, &Options{
+		Quiet:           true,
+		EnableBasicAuth: true,
+		Credential:      `admin:p'ass"word`,
+		WSQueryArgs:     `foo=1';alert(1)//`,
+		Preferences: &Preferences{
+			Theme:           "catppuccin-mocha",
+			FontSize:        14,
+			FontFamily:      "monospace",
+			CursorBlink:     true,
+			ScrollbackLines: 5000,
+			EnableWebGL:     true,
+			AltIsMeta:       true,
+			ColorPaletteOverrides: []string{
+				"#000000", "#ff0000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	// 1. Test handleAuthToken safely JSON-encodes quotes
+	rec := httptest.NewRecorder()
+	srv.handleAuthToken(rec, httptest.NewRequest(http.MethodGet, "/auth_token.js", nil))
+	if !strings.Contains(rec.Body.String(), `var gotty_auth_token = "admin:p'ass\"word";`) {
+		t.Fatalf("unexpected auth_token.js output: %s", rec.Body.String())
+	}
+
+	// 2. Test handleConfig safely JSON-encodes WSQueryArgs and builds preferences
+	rec = httptest.NewRecorder()
+	srv.handleConfig(rec, httptest.NewRequest(http.MethodGet, "/config.js", nil))
+	if !strings.Contains(rec.Body.String(), `var gotty_ws_query_args = "foo=1';alert(1)//";`) {
+		t.Fatalf("unexpected config.js output: %s", rec.Body.String())
+	}
+
+	// 3. Test wrapBasicAuth: missing header -> 401
+	wrapped := srv.wrapBasicAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}), srv.options.Credential)
+
+	rec = httptest.NewRecorder()
+	wrapped.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for missing auth header, got %d", rec.Code)
+	}
+
+	// 4. Test wrapBasicAuth: invalid base64 -> 401 (not 500)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Basic !!!not-base64!!!")
+	rec = httptest.NewRecorder()
+	wrapped.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for invalid base64 auth header, got %d", rec.Code)
+	}
+
+	// 5. Test wrapBasicAuth: wrong password -> 401
+	req = httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Basic YWRtaW46d3Jvbmc=")
+	rec = httptest.NewRecorder()
+	wrapped.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for wrong basic auth password, got %d", rec.Code)
+	}
+}

@@ -15,10 +15,13 @@ export CGO_ENABLED=0
 gotty: main.go assets server/*.go webtty/*.go backend/*.go Makefile
 	go build ${BUILD_OPTIONS}
 
+godl: cmd/godl/main.go
+	go build ${BUILD_OPTIONS} -o godl ./cmd/godl
+
 docker:
 	docker build . -t gotty-bash:$(VERSION)
 
-.PHONY: all docker assets
+.PHONY: all docker assets godl
 assets: bindata/static/js/gotty.js.map \
 	bindata/static/js/gotty.js \
 	bindata/static/index.html \
@@ -30,7 +33,7 @@ assets: bindata/static/js/gotty.js.map \
 	bindata/static/manifest.json \
 	bindata/static/icon_192.png
 
-all: gotty
+all: gotty godl
 
 bindata/static bindata/static/css bindata/static/js:
 	mkdir -p $@
@@ -48,11 +51,11 @@ js/node_modules/@xterm/xterm/dist/xterm.css:
 	cd js && \
 	npm install
 
-bindata/static/js/gotty.js.map bindata/static/js/gotty.js: js/src/* | js/node_modules/webpack
+bindata/static/js/gotty.js.map bindata/static/js/gotty.js: js/src/* | js/node_modules/vite
 	cd js && \
-	npx webpack --mode=$(WEBPACK_MODE)
+	npx vite build
 
-js/node_modules/webpack:
+js/node_modules/vite:
 	cd js && \
 	npm install
 

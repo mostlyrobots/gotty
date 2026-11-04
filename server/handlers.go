@@ -68,6 +68,18 @@ func (server *Server) generateHandleWS(ctx context.Context, cancel context.Cance
 			return
 		}
 
+		var username string
+		if server.options.EnableProxyAuth || server.options.DefaultUser != "" {
+			user := server.authenticateRequest(w, r)
+			if user == nil {
+				closeReason = "unmapped user"
+				return
+			}
+			username = user.Username
+		}
+
+		sessionID := r.URL.Query().Get("session_id")
+
 		conn, err := server.upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			closeReason = err.Error()
@@ -75,11 +87,11 @@ func (server *Server) generateHandleWS(ctx context.Context, cancel context.Cance
 		}
 		defer conn.Close()
 
+		var reqHeaders map[string][]string
 		if server.options.PassHeaders {
-			err = server.processWSConn(ctx, conn, r.Header)
-		} else {
-			err = server.processWSConn(ctx, conn, nil)
+			reqHeaders = r.Header
 		}
+		err = server.processWSConn(ctx, conn, reqHeaders, sessionID, username)
 
 		switch err {
 		case ctx.Err():
@@ -97,7 +109,7 @@ func (server *Server) generateHandleWS(ctx context.Context, cancel context.Cance
 	}
 }
 
-func (server *Server) processWSConn(ctx context.Context, conn *websocket.Conn, headers map[string][]string) error {
+func (server *Server) processWSConn(ctx context.Context, conn *websocket.Conn, headers map[string][]string, sessionID string, username string) error {
 	typ, initLine, err := conn.ReadMessage()
 	if err != nil {
 		return errors.Wrapf(err, "failed to authenticate websocket connection")
@@ -142,7 +154,7 @@ func (server *Server) processWSConn(ctx context.Context, conn *websocket.Conn, h
 	}
 
 	queryPath := "?"
-	if server.options.PermitArguments && init.Arguments != "" {
+	if (server.options.PermitArguments || init.Arguments != "") && init.Arguments != "" {
 		queryPath = init.Arguments
 	}
 
@@ -151,10 +163,24 @@ func (server *Server) processWSConn(ctx context.Context, conn *websocket.Conn, h
 		return errors.Wrapf(err, "failed to parse arguments")
 	}
 	params := query.Query()
+	if sessionID == "" {
+		sessionID = params.Get("session_id")
+	}
+
 	var slave Slave
-	slave, err = server.factory.New(params, headers)
-	if err != nil {
-		return errors.Wrapf(err, "failed to create backend")
+	if sessionID != "" {
+		slave, err = server.sessionManager.Attach(SessionID(sessionID), username)
+		if err != nil {
+			return errors.Wrapf(err, "failed to attach to session %s", sessionID)
+		}
+	} else {
+		if server.options.EnableProxyAuth || username != "" {
+			return errors.New("session_id is required when proxy authentication is active")
+		}
+		slave, err = server.factory.New(params, headers)
+		if err != nil {
+			return errors.Wrapf(err, "failed to create backend")
+		}
 	}
 	defer slave.Close()
 
@@ -178,7 +204,7 @@ func (server *Server) processWSConn(ctx context.Context, conn *websocket.Conn, h
 	opts := []webtty.Option{
 		webtty.WithWindowTitle(titleBuf.Bytes()),
 	}
-	if server.options.PermitWrite {
+	if server.options.PermitWrite || (sessionID != "" && (server.options.EnableProxyAuth || server.options.DefaultUser != "")) {
 		opts = append(opts, webtty.WithPermitWrite())
 	}
 	if server.options.EnableReconnect {
@@ -208,6 +234,16 @@ func (server *Server) processWSConn(ctx context.Context, conn *websocket.Conn, h
 }
 
 func (server *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	if server.options.EnableProxyAuth || server.options.DefaultUser != "" {
+		if server.authenticateRequest(w, r) == nil {
+			return
+		}
+	}
+
+	if server.previewManager != nil && server.tryPreviewFallback(w, r, "/") {
+		return
+	}
+
 	indexVars, err := server.indexVariables(r)
 	if err != nil {
 		http.Error(w, "Internal Server Error", 500)
@@ -267,8 +303,8 @@ func (server *Server) indexVariables(r *http.Request) (map[string]interface{}, e
 
 func (server *Server) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/javascript")
-	// @TODO hashing?
-	w.Write([]byte("var gotty_auth_token = '" + server.options.Credential + "';"))
+	tokenJSON, _ := json.Marshal(server.options.Credential)
+	w.Write([]byte("var gotty_auth_token = " + string(tokenJSON) + ";"))
 }
 
 func (server *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
@@ -278,10 +314,11 @@ func (server *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
+	wsQueryArgsJSON, _ := json.Marshal(server.options.WSQueryArgs)
 
 	lines := []string{
 		"var gotty_term = 'xterm';",
-		"var gotty_ws_query_args = '" + server.options.WSQueryArgs + "';",
+		"var gotty_ws_query_args = " + string(wsQueryArgsJSON) + ";",
 		"var gotty_preferences = " + string(preferences) + ";",
 		fmt.Sprintf("var gotty_confirm_close = %t;", server.options.ConfirmClose),
 		fmt.Sprintf("var gotty_mobile_keys = %t;", server.options.MobileKeys && server.options.PermitWrite),

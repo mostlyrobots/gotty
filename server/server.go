@@ -22,6 +22,7 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/sorenisanerd/gotty/bindata"
+	"github.com/sorenisanerd/gotty/pkg/auth"
 	"github.com/sorenisanerd/gotty/pkg/homedir"
 	"github.com/sorenisanerd/gotty/pkg/randomstring"
 	"github.com/sorenisanerd/gotty/webtty"
@@ -29,9 +30,12 @@ import (
 
 // Server provides a webtty HTTP endpoint.
 type Server struct {
-	factory      Factory
-	options      *Options
-	clientGoneCh chan<- string
+	factory        Factory
+	options        *Options
+	clientGoneCh   chan<- string
+	authResolver   *auth.Resolver
+	sessionManager *SessionManager
+	previewManager *PreviewManager
 
 	upgrader         *websocket.Upgrader
 	indexTemplate    *template.Template
@@ -86,7 +90,7 @@ func New(factory Factory, options *Options) (*Server, error) {
 		return nil, errors.Wrapf(err, "failed to parse window title format `%s`", options.TitleFormat)
 	}
 
-	var originChecker func(r *http.Request) bool
+	originChecker := checkSameOrigin
 	if options.WSOrigin != "" {
 		matcher, err := regexp.Compile(options.WSOrigin)
 		if err != nil {
@@ -97,10 +101,37 @@ func New(factory Factory, options *Options) (*Server, error) {
 		}
 	}
 
+	var hostGroups []string
+	if strings.TrimSpace(options.HostGroups) != "" {
+		for _, g := range strings.Split(options.HostGroups, ",") {
+			if trimmed := strings.TrimSpace(g); trimmed != "" {
+				hostGroups = append(hostGroups, trimmed)
+			}
+		}
+	}
+
+	resolver := &auth.Resolver{
+		PasswdPath: options.PasswdFile,
+		GroupPath:  options.GroupFile,
+		HostGroups: hostGroups,
+	}
+
+	spawner := func(user *auth.UserIdentity, sessionID SessionID, mode string) (Slave, error) {
+		return NewContainerSlave(user, string(sessionID), ContainerOptions{
+			Runtime:      options.ContainerRuntime,
+			DefaultImage: options.ContainerImage,
+			Mode:         mode,
+			FallbackHost: options.ContainerRuntime == "",
+		})
+	}
+
 	return &Server{
-		factory:      factory,
-		options:      options,
-		clientGoneCh: options.ClientGoneCh,
+		factory:        factory,
+		options:        options,
+		clientGoneCh:   options.ClientGoneCh,
+		authResolver:   resolver,
+		sessionManager: NewSessionManager(spawner),
+		previewManager: NewPreviewManager(),
 
 		upgrader: &websocket.Upgrader{
 			ReadBufferSize:  1024,
@@ -112,6 +143,16 @@ func New(factory Factory, options *Options) (*Server, error) {
 		titleTemplate:    titleTemplate,
 		manifestTemplate: manifestTemplate,
 	}, nil
+}
+
+// SessionManager returns the server's active SessionManager.
+func (server *Server) SessionManager() *SessionManager {
+	return server.sessionManager
+}
+
+// AuthResolver returns the server's /etc/passwd & /etc/group identity resolver.
+func (server *Server) AuthResolver() *auth.Resolver {
+	return server.authResolver
 }
 
 // Run starts the main process of the Server.
@@ -235,6 +276,9 @@ func (server *Server) Run(ctx context.Context, options ...RunOption) error {
 		log.Printf("Waiting for %d connections to be closed", conn)
 	}
 	counter.wait()
+	if server.previewManager != nil {
+		server.previewManager.Close()
+	}
 
 	return err
 }
@@ -259,6 +303,16 @@ func (server *Server) setupHandlers(ctx context.Context, cancel context.CancelFu
 	siteMux.HandleFunc(pathPrefix+"config.js", server.handleConfig)
 	siteMux.HandleFunc(pathPrefix+"themes.js", server.handleThemes)
 
+	// Session management, file transfer, user config & preview REST endpoints
+	apiSessionsPath := pathPrefix + "api/sessions"
+	apiSessionsSubPath := pathPrefix + "api/sessions/"
+	siteMux.HandleFunc(apiSessionsPath, server.handleAPISessions)
+	siteMux.HandleFunc(apiSessionsSubPath, func(w http.ResponseWriter, r *http.Request) {
+		server.handleAPISessionByID(w, r, apiSessionsSubPath)
+	})
+	siteMux.HandleFunc(pathPrefix+"api/user/config", server.handleAPIUserConfig)
+	siteMux.HandleFunc(pathPrefix+"api/preview", server.handleAPIPreview)
+
 	siteHandler := http.Handler(siteMux)
 
 	if server.options.EnableBasicAuth {
@@ -269,8 +323,22 @@ func (server *Server) setupHandlers(ctx context.Context, cancel context.CancelFu
 	withGz := gziphandler.GzipHandler(server.wrapHeaders(siteHandler))
 	siteHandler = server.wrapLogger(withGz)
 
+	previewPrefix := pathPrefix + "preview/"
+	previewHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		server.handlePreviewProxy(w, r, previewPrefix)
+	})
+	var wrappedPreview http.Handler = previewHandler
+	if server.options.EnableBasicAuth {
+		wrappedPreview = server.wrapBasicAuth(wrappedPreview, server.options.Credential)
+	}
+	wrappedPreview = server.wrapLogger(wrappedPreview)
+
 	wsMux := http.NewServeMux()
 	wsMux.Handle("/", siteHandler)
+	wsMux.Handle(previewPrefix, wrappedPreview)
+	wsMux.HandleFunc(pathPrefix+"preview", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, previewPrefix, http.StatusTemporaryRedirect)
+	})
 	wsMux.HandleFunc(pathPrefix+"ws", server.generateHandleWS(ctx, cancel, counter))
 	siteHandler = http.Handler(wsMux)
 

@@ -4,7 +4,7 @@ import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { ImageAddon } from '@xterm/addon-image';
-import { ZModemAddon } from "./zmodem";
+import { DownloadEvent, Osc7777Receiver, triggerBrowserDownload } from "./osc7777";
 
 export class GoTTYXterm {
     // The HTMLElement that contains our terminal
@@ -23,13 +23,14 @@ export class GoTTYXterm {
     onDataHandler!: IDisposable;
 
     fitAddOn: FitAddon;
-    zmodemAddon: ZModemAddon;
     toServer!: (data: string | Uint8Array) => void;
     encoder: TextEncoder;
     altIsMeta: boolean = false;
     // Rewrites typed input before it is sent; set by the mobile key strip so
     // its armed modifiers apply to the phone keyboard's next character.
     inputTransformer: ((data: string) => string) | null = null;
+    onOsc7777?: (dl: DownloadEvent) => void;
+    osc7777Receiver: Osc7777Receiver;
 
     constructor(elem: HTMLElement, preferences: Record<string, unknown> = {}) {
         this.elem = elem;
@@ -47,14 +48,9 @@ export class GoTTYXterm {
         this.setPreferences(preferences);
 
         this.fitAddOn = new FitAddon();
-        this.zmodemAddon = new ZModemAddon({
-            toTerminal: (x: Uint8Array) => this.term.write(x),
-            toServer: (x: Uint8Array) => this.sendInput(x)
-        });
         this.term.loadAddon(new WebLinksAddon());
         this.term.loadAddon(this.fitAddOn);
         this.term.loadAddon(new ImageAddon());
-        this.term.loadAddon(this.zmodemAddon);
 
         this.message = elem.ownerDocument.createElement("div");
         this.message.className = "xterm-overlay";
@@ -85,6 +81,13 @@ export class GoTTYXterm {
         this.setupAltIsMeta();
 
         this.setupOsc52();
+        this.osc7777Receiver = new Osc7777Receiver((dl) => {
+            triggerBrowserDownload(dl.filename, dl.data);
+            if (this.onOsc7777) {
+                this.onOsc7777(dl);
+            }
+        });
+        this.setupOsc7777();
 
         window.addEventListener("resize", () => { this.resizeListener(); });
     };
@@ -109,7 +112,7 @@ export class GoTTYXterm {
 
     // This gets called from the Websocket's onReceive handler
     output(data: Uint8Array) {
-        this.zmodemAddon.consume(data);
+        this.term.write(data);
     };
 
     getMessage(): HTMLElement {
@@ -145,7 +148,9 @@ export class GoTTYXterm {
     }
 
     setWindowTitle(title: string) {
-        document.title = title;
+        if (title && !title.includes("@") && !title.startsWith("/bin/")) {
+            document.title = title;
+        }
     };
 
     setPreferences(value?: Record<string, unknown> | null) {
@@ -276,6 +281,12 @@ export class GoTTYXterm {
                 }
             } catch {}
             return true;
+        });
+    };
+
+    setupOsc7777() {
+        this.term.parser.registerOscHandler(7777, (data: string) => {
+            return this.osc7777Receiver.handle(data);
         });
     };
 

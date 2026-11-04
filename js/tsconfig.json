@@ -23,6 +23,7 @@
     "dist",
     "e2e",
     "vitest.config.mts",
-    "playwright.config.ts"
+    "playwright.config.ts",
+    "vite.config.ts"
   ]
 }

@@ -19,7 +19,7 @@ type Options struct {
 	EnableTLSClientAuth bool   `hcl:"enable_tls_client_auth" default:"false"`
 	TLSCACrtFile        string `hcl:"tls_ca_crt_file" flagName:"tls-ca-crt" flagDescribe:"TLS/SSL CA certificate file for client certifications" default:"~/.gotty.ca.crt"`
 	IndexFile           string `hcl:"index_file" flagName:"index" flagDescribe:"Custom index.html file" default:""`
-	TitleFormat         string `hcl:"title_format" flagName:"title-format" flagSName:"" flagDescribe:"Title format of browser window" default:"{{ .command }}@{{ .hostname }}"`
+	TitleFormat         string `hcl:"title_format" flagName:"title-format" flagSName:"" flagDescribe:"Title format of browser window" default:"Terminal"`
 	EnableReconnect     bool   `hcl:"enable_reconnect" flagName:"reconnect" flagDescribe:"Enable reconnection" default:"false"`
 	ReconnectTime       int    `hcl:"reconnect_time" flagName:"reconnect-time" flagDescribe:"Time to reconnect" default:"10"`
 	MaxConnection       int    `hcl:"max_connection" flagName:"max-connection" flagDescribe:"Maximum connection to gotty" default:"0"`
@@ -62,6 +62,17 @@ type Options struct {
 	// when the browser tab is in the background (where JS timers are throttled).
 	// Set to 0 to disable.
 	PingInterval int `hcl:"ping_interval" flagName:"ping-interval" flagSName:"" flagDescribe:"WebSocket server ping interval in seconds (0 to disable)" default:"30"`
+
+	// Proxy identity & container options
+	EnableProxyAuth  bool   `hcl:"enable_proxy_auth" flagName:"proxy-auth" flagDescribe:"Require X-Forwarded-User header mapped in /etc/passwd" default:"false"`
+	ProxyAuthHeader  string `hcl:"proxy_auth_header" flagName:"proxy-auth-header" flagDescribe:"Specific HTTP header to read proxy identity from (empty checks standard headers)" default:""`
+	PasswdFile       string `hcl:"passwd_file" flagName:"passwd-file" flagDescribe:"Path to passwd file for X-Forwarded-User GECOS lookup" default:"/etc/passwd"`
+	GroupFile        string `hcl:"group_file" flagName:"group-file" flagDescribe:"Path to group file for privilege resolution" default:"/etc/group"`
+	HostGroups       string `hcl:"host_groups" flagName:"host-groups" flagDescribe:"Comma-separated Linux groups granted host shell access" default:"wheel,sudo,gotty-host"`
+	ContainerRuntime string `hcl:"container_runtime" flagName:"container-runtime" flagDescribe:"Container runtime (docker or podman)" default:""`
+	ContainerImage   string `hcl:"container_image" flagName:"container-image" flagDescribe:"Default container image for user sessions" default:"gotty-sandbox:latest"`
+	DefaultUser      string `hcl:"default_user" flagName:"default-user" flagDescribe:"Fallback system username if no identity header is provided by proxy" default:""`
+	DefaultMode      string `hcl:"default_mode" flagName:"default-mode" flagDescribe:"Default session execution mode: sandbox or host" default:"sandbox"`
 }
 
 // Preferences holds terminal color/font/cursor settings.

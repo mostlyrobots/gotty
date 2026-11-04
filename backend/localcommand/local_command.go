@@ -111,6 +111,33 @@ func (lcmd *LocalCommand) WindowTitleVariables() map[string]interface{} {
 	}
 }
 
+func (lcmd *LocalCommand) ResolveCWD() (string, error) {
+	if lcmd.cmd == nil || lcmd.cmd.Process == nil || lcmd.cmd.Process.Pid <= 0 {
+		return "", errors.New("process not running")
+	}
+	cwd, err := os.Readlink("/proc/" + strings.TrimSpace(string(rune(lcmd.cmd.Process.Pid))) + "/cwd")
+	if err != nil {
+		// Use fmt-free strconv fallback
+		return os.Readlink(procCwdPath(lcmd.cmd.Process.Pid))
+	}
+	return cwd, nil
+}
+
+func procCwdPath(pid int) string {
+	if pid == 0 {
+		return "/proc/self/cwd"
+	}
+	var digits [20]byte
+	i := len(digits)
+	p := pid
+	for p > 0 {
+		i--
+		digits[i] = byte('0' + p%10)
+		p /= 10
+	}
+	return "/proc/" + string(digits[i:]) + "/cwd"
+}
+
 func (lcmd *LocalCommand) ResizeTerminal(width int, height int) error {
 	window := pty.Winsize{
 		Rows: uint16(height),

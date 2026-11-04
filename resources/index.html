@@ -4,6 +4,9 @@
 <head>
   <title>{{ .title }}</title>
   <link rel="manifest" href="manifest.json" crossorigin="use-credentials">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Anonymous+Pro:wght@400;700&family=Courier+Prime:wght@400;700&family=Fira+Code:wght@400;600&family=IBM+Plex+Mono:wght@400;600&family=Inconsolata:wght@400;600&family=JetBrains+Mono:wght@400;600&family=Roboto+Mono:wght@400;600&family=Source+Code+Pro:wght@400;600&family=Space+Mono:wght@400;700&family=Ubuntu+Mono:wght@400;700&display=swap" rel="stylesheet">
   {{ if .favicon }}
   <link rel="icon" href="{{ .favicon }}">
   {{ else }}

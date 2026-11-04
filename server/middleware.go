@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/subtle"
 	"encoding/base64"
 	"log"
 	"net/http"
@@ -35,11 +36,12 @@ func (server *Server) wrapBasicAuth(handler http.Handler, credential string) htt
 
 		payload, err := base64.StdEncoding.DecodeString(token[1])
 		if err != nil {
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			w.Header().Set("WWW-Authenticate", `Basic realm="GoTTY"`)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 
-		if credential != string(payload) {
+		if subtle.ConstantTimeCompare([]byte(credential), payload) != 1 {
 			w.Header().Set("WWW-Authenticate", `Basic realm="GoTTY"`)
 			http.Error(w, "authorization failed", http.StatusUnauthorized)
 			return

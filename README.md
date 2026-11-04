@@ -1,482 +1,152 @@
-# ![](https://raw.githubusercontent.com/sorenisanerd/gotty/master/resources/favicon.ico) GoTTY - Share your terminal as a web application
-<!-- ALL-CONTRIBUTORS-BADGE:START - Do not remove or modify this section -->
-[![All Contributors](https://img.shields.io/badge/all_contributors-80-orange.svg?style=flat-square)](#contributors-)
-<!-- ALL-CONTRIBUTORS-BADGE:END -->
+# GoTTY
 
-[![GitHub release](http://img.shields.io/github/release/sorenisanerd/gotty.svg?style=flat-square)][release]
-[![MIT License](http://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)][license]
-[![Maintainer streaming](https://twitch-status.soren.tools/sorencodes)][twitch]
+[![MIT License](http://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
 
-[release]: https://github.com/sorenisanerd/gotty/releases
-[license]: https://github.com/sorenisanerd/gotty/blob/master/LICENSE
-[twitch]: https://twitch.tv/sorencodes
+GoTTY shares a terminal over the web. This repository builds on the original [yudai/gotty](https://github.com/yudai/gotty) and [sorenisanerd/gotty](https://github.com/sorenisanerd/gotty) project by adding a multi-tab frontend, server-side session persistence, reverse-proxy user mapping, container-isolated sessions, file upload/download utilities, and a local HTTP/WebSocket preview proxy.
 
-GoTTY is a simple command line tool that turns your CLI tools into web applications.
+*Original work by the [GoTTY project](https://github.com/yudai/gotty) ([Iwasaki Yudai](https://github.com/yudai/gotty) and [Soren L. Hansen](https://github.com/sorenisanerd/gotty)).*  
+*Multi-session and container support authored by **Google Gemini 4 Argon**.*
 
-[Original work](https://github.com/yudai/gotty) by [Iwasaki Yudai](https://github.com/yudai). There would be no GoTTY without him. ❤️
+---
 
-![Screenshot](https://raw.githubusercontent.com/sorenisanerd/gotty/master/screenshot.gif)
+## Deployment Model: Requires a Frontend Reverse Proxy
 
-# Installation
+> [!IMPORTANT]
+> **This application is not intended to be exposed directly to the network on its own.**  
+> It is designed to run on `127.0.0.1` (or an internal container bridge) behind an authenticating frontend proxy such as [Nginx Proxy Manager (NPM)](https://nginxproxymanager.com/), Authelia, Authentik, or OAuth2 Proxy. The frontend proxy is responsible for handling SSL/TLS termination, authenticating users, and forwarding the authenticated username or email address to GoTTY via HTTP headers (such as `X-Forwarded-User` or `Remote-User`).
 
-## From release page
+---
 
-You can download the latest stable binary file from the [Releases](https://github.com/sorenisanerd/gotty/releases) page. Note that the release marked `Pre-release` is built for testing purpose, which can include unstable or breaking changes. Download a release marked [Latest release](https://github.com/sorenisanerd/gotty/releases/latest) for a stable build.
+## What Was Added to Upstream GoTTY
 
-(Files named with `darwin_amd64` are for Mac OS X users)
+Upstream GoTTY runs a single command per WebSocket connection and terminates the process when the browser tab closes. This fork adds:
 
-## Homebrew Installation
+1. **Multi-Tab Interface**: A Svelte 5 + xterm.js top bar that manages multiple terminal sessions in one browser window without requiring `tmux` or `screen`.
+2. **Server-Side Session Persistence (`SessionManager`)**: Terminal processes stay running on the server when a browser disconnects or reloads. Each session keeps a 1MB circular ring buffer in memory so reconnecting clients receive recent terminal output before live output resumes.
+3. **Reverse-Proxy User Mapping (`/etc/passwd` & `/etc/group`)**: Reads the identity header forwarded by the reverse proxy and resolves it against `/etc/passwd` (matching either the Linux username or an email address in the 5th GECOS field). Group membership in `/etc/group` determines whether the user is limited to a sandboxed container or can open a host shell.
+4. **Two Session Modes (`sandbox` and `host`)**:
+   - **Sandbox (`sandbox`)**: Starts an Ubuntu 24.04 container (`gotty-sandbox:latest`) running under the user's UID/GID with only `/home/<username>` mounted. Standard users are restricted to this mode.
+   - **Host Shell (`host`)**: Allocates a native host PTY under the user's UID, GID, and supplementary groups. Available only to users in `wheel`, `sudo`, or `gotty-host` (configurable via `--host-groups`).
+5. **File Upload & Download (`godl`)**:
+   - **Upload**: Dragging files onto the terminal (or clicking the upload button in the top bar) sends them via `POST /api/sessions/:id/upload` into the shell's current working directory (`/proc/<pid>/cwd`), falling back to `/home/<username>`.
+   - **Download**: Running `godl <filepath>` inside a session encodes the file into OSC 7777 terminal escape sequences that the browser intercepts and saves through the standard browser download dialog.
+6. **Local Web Preview Proxy**: A top-bar menu that proxies HTTP, HTTPS, and WebSocket traffic to local services running on the server (`/preview/<host>:<port>/`). On startup, GoTTY introspects active network interfaces so host-authorized users can select `localhost` or local private interface IPs; sandboxed users are restricted to `localhost`.
+7. **Per-User Configuration (`~/.gotty/config.yaml`)**: A settings drawer that saves theme, font family, font size, scrollback length, clipboard behavior, keyboard shortcuts, and detached session cleanup timers to the user's home directory.
 
-You can install GoTTY with [Homebrew](http://brew.sh/) as well.
+---
 
-```sh
-$ brew install sorenisanerd/gotty/gotty
+## Setup & Installation
+
+### 1. Run the Installer
+[`./install.sh`](install.sh) checks for Node/NPM and Go, builds the `gotty-sandbox:latest` container image from [`Containerfile`](Containerfile) if Docker or Podman is installed, compiles the frontend and the `gotty` and `godl` binaries to `/usr/local/bin`, creates the `gotty-host` group, and writes `/etc/systemd/system/gotty.service`.
+
+```bash
+chmod +x ./install.sh
+./install.sh
 ```
 
-## `go get` Installation (Development)
+### 2. Map Users in `/etc/passwd` and `/etc/group`
+When `--proxy-auth` is enabled, GoTTY maps the header sent by your proxy to a local Linux user account:
 
-If you have a Go language environment, you can install GoTTY with the `go get` command. However, this command builds a binary file from the latest master branch, which can include unstable or breaking changes. GoTTY requires go1.9 or later.
+```bash
+# Map an email address to an existing Linux user via the GECOS field in /etc/passwd:
+sudo usermod -c "Dev User,devuser@example.com" devuser
 
-```sh
-$ go get github.com/sorenisanerd/gotty
+# (Optional) Allow the user to open Host Shell sessions by adding them to gotty-host:
+sudo groupadd -f gotty-host
+sudo usermod -aG gotty-host devuser
+
+# Or create a user restricted to Sandbox container sessions only:
+sudo useradd -m -s /bin/bash -c "Guest User,guest@example.com" guest
 ```
 
-# Usage
+### 3. Configure the Frontend Proxy
+Set up your reverse proxy (for example, [Nginx Proxy Manager](https://nginxproxymanager.com/)) to handle HTTPS and authentication in front of GoTTY:
 
-```
-Usage: gotty [options] <command> [<arguments...>]
-```
+1. Point the proxy host to `http://127.0.0.1:8080`.
+2. Enable **Websockets Support**.
+3. Configure an **Access List** (Basic Auth or an external auth provider such as Authelia/OAuth2 Proxy).
+4. In the **Advanced** Nginx configuration tab, forward the authenticated user and host headers:
+   ```nginx
+   proxy_set_header Host $host;
+   proxy_set_header X-Forwarded-Host $host;
+   proxy_set_header X-Forwarded-User $remote_user;
+   client_max_body_size 512M;
+   ```
 
-Run `gotty` with your preferred command as its arguments (e.g. `gotty top`).
-
-By default, GoTTY starts a web server at port 8080. Open the URL on your web browser and you can see the running command as if it were running on your terminal.
-
-## Options
-```sh
-   --address value, -a value     IP address(es) to listen (comma-separated for multiple) (default: "0.0.0.0") [$GOTTY_ADDRESS]
-   --port value, -p value        Port number to liten (default: "8080") [$GOTTY_PORT]
-   --path value, -m value        Base path (default: "/") [$GOTTY_PATH]
-   --permit-write, -w            Permit clients to write to the TTY (BE CAREFUL) (default: false) [$GOTTY_PERMIT_WRITE]
-   --credential value, -c value  Credential for Basic Authentication (ex: user:pass, default disabled) [$GOTTY_CREDENTIAL]
-   --random-url, -r              Add a random string to the URL (default: false) [$GOTTY_RANDOM_URL]
-   --random-url-length value     Random URL length (default: 8) [$GOTTY_RANDOM_URL_LENGTH]
-   --tls, -t                     Enable TLS/SSL (default: false) [$GOTTY_TLS]
-   --tls-crt value               TLS/SSL certificate file path (default: "~/.gotty.crt") [$GOTTY_TLS_CRT]
-   --tls-key value               TLS/SSL key file path (default: "~/.gotty.key") [$GOTTY_TLS_KEY]
-   --tls-ca-crt value            TLS/SSL CA certificate file for client certifications (default: "~/.gotty.ca.crt") [$GOTTY_TLS_CA_CRT]
-   --index value                 Custom index.html file [$GOTTY_INDEX]
-   --title-format value          Title format of browser window (default: "{{ .command }}@{{ .hostname }}") [$GOTTY_TITLE_FORMAT]
-   --reconnect                   Enable reconnection (default: false) [$GOTTY_RECONNECT]
-   --reconnect-time value        Time to reconnect (default: 10) [$GOTTY_RECONNECT_TIME]
-   --max-connection value        Maximum connection to gotty (default: 0) [$GOTTY_MAX_CONNECTION]
-   --once                        Accept only one client and exit on disconnection (default: false) [$GOTTY_ONCE]
-   --timeout value               Timeout seconds for waiting a client(0 to disable) (default: 0) [$GOTTY_TIMEOUT]
-   --permit-arguments            Permit clients to send command line arguments in URL (e.g. http://example.com:8080/?arg=AAA&arg=BBB) (default: false) [$GOTTY_PERMIT_ARGUMENTS]
-   --pass-headers                Pass HTTP request headers as environment variables (e.g. Cookie becomes HTTP_COOKIE) (default: false) [$GOTTY_PASS_HEADERS]
-   --width value                 Static width of the screen, 0(default) means dynamically resize (default: 0) [$GOTTY_WIDTH]
-   --height value                Static height of the screen, 0(default) means dynamically resize (default: 0) [$GOTTY_HEIGHT]
-   --ws-origin value             A regular expression that matches origin URLs to be accepted by WebSocket. No cross origin requests are acceptable by default [$GOTTY_WS_ORIGIN]
-   --ws-query-args value         Querystring arguments to append to the websocket instantiation [$GOTTY_WS_QUERY_ARGS]
-   --enable-webgl                Enable WebGL renderer (default: true) [$GOTTY_ENABLE_WEBGL]
-   --confirm-close               Ask the browser to confirm before closing/reloading the page while a session is connected (default: true) [$GOTTY_CONFIRM_CLOSE]
-   --mobile-keys                 Show a strip of special keys (Esc, Ctrl, Alt, Tab, arrows, ...) above the on-screen keyboard on touch devices (default: true) [$GOTTY_MOBILE_KEYS]
-   --quiet                       Don't log (default: false) [$GOTTY_QUIET]
-   --favicon value               Custom favicon (file path, URL, or data URI) [$GOTTY_FAVICON]
-   --ping-interval value         WebSocket server ping interval in seconds (0 to disable) (default: 30) [$GOTTY_PING_INTERVAL]
-   --close-signal value          Signal sent to the command process when gotty close it (default: SIGHUP) (default: 1) [$GOTTY_CLOSE_SIGNAL]
-   --close-timeout value         Time in seconds to force kill process after client is disconnected (default: -1) (default: -1) [$GOTTY_CLOSE_TIMEOUT]
-   --config value                Config file path (default: "~/.gotty") [$GOTTY_CONFIG]
-   --help, -h                    show help
-   --version, -v                 print the version
-```
-### Config File
-You can customize default options and your terminal by providing a config file to the `gotty` command. GoTTY loads a profile file at `~/.gotty` by default when it exists.
-
-```
-// Listen at port 9000 by default
-port = "9000"
-
-// Enable TSL/SSL by default
-enable_tls = true
-
+### 4. Start the Service
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now gotty
 ```
 
-See the [`.gotty`](https://github.com/sorenisanerd/gotty/blob/master/.gotty) file in this repository for the list of configuration options.
+---
 
-### Display Customization
+## How to Use the System
 
-GoTTY lets you customize the look of your terminal session — themes, fonts,
-cursor style, and more — through two channels: a **config file** for
-server-side defaults, and an on-screen **runtime picker** for live tweaking
-that persists to your browser's localStorage.
+### Managing Terminal Tabs & Session Modes
+- **New Tab**: Click the `+` button in the top bar (or press `Alt+T`) to open a new session using your default mode.
+- **Selecting a Mode**: Click the chevron next to the `+` button to choose between:
+  - **Sandbox Container**: Runs inside an isolated Ubuntu 24.04 container with `/home/<username>` mounted.
+  - **Host Shell**: Runs directly on the host OS (only works if your Linux user belongs to `gotty-host`, `wheel`, or `sudo`; otherwise the server places the session in a sandbox container).
+- **Renaming a Tab**: Double-click the tab title, click the pencil icon on the active tab, or emit a standard xterm title sequence from the shell (`printf '\033]2;Custom Name\007'`).
+- **Closing vs. Detaching**:
+  - Closing the browser window leaves the session running on the server; reopening the page reconnects to your active tabs and replays the 1MB output buffer.
+  - Clicking the `×` button on a tab (or pressing `Alt+W`) sends `DELETE /api/sessions/:id` and terminates that underlying shell/container.
 
-#### Themes
+### Uploading & Downloading Files
+- **Upload**: Drag and drop one or more files onto the terminal area, or click the **Upload** icon in the top bar. The server checks `/proc/<pid>/cwd` of the active shell process and writes the file into that directory (or into `/home/<username>` if the working directory cannot be resolved).
+- **Download (`godl`)**: From inside the terminal, run:
+  ```bash
+  godl /path/to/file.tar.gz
+  ```
+  `godl` reads the file and writes base64-encoded OSC 7777 chunks to stdout. The browser intercepts those sequences and saves the file locally.
 
-GoTTY ships with 6 built-in color themes:
+### Using Web Preview
+1. Start an HTTP/HTTPS server inside your session (for example, `python3 -m http.server 8000` or a dev server on port `3000` or `8080`).
+2. Click the **Preview** icon (browser window with eye) in the top-right bar.
+3. Choose the target interface IP (populated at server startup by introspecting local network interfaces), set the port and protocol (`Auto`, `HTTP`, or `HTTPS`), and click **Preview**.
+4. A new browser tab opens at `./preview/<host>:<port>/`, proxying requests and WebSockets through GoTTY to that local port.
 
-| Theme | Description |
-|-------|-------------|
-| `default` | Catppuccin Mocha — warm, high-contrast |
-| `nord` | Arctic bluish-cold palette |
-| `dracula` | Dark purple-based high-contrast |
-| `solarized-dark` | Classic solarized dark |
-| `monokai` | High-contrast vivid theme |
-| `light` | Clean light theme |
+### Adjusting User Preferences
+Click the **Settings** (gear) icon in the top-right bar to configure:
+- **Color Theme**: `catppuccin-mocha`, `tokyo-night`, `nord`, `monokai`, or `solarized-dark`.
+- **Text Size & Scrollback**: Font size (`8px`–`32px`) and scrollback buffer lines.
+- **Font Family**: Select from preloaded web fonts, system monospace fonts, or scan local system fonts via the browser's Local Font Access API.
+- **Detached Session Reap Policy**: How long a session with no connected browser tabs stays alive before automatic termination (`never`, `1h`, `2h`, `8h`, `24h`).
+- **Copy & Keybindings**: Toggle `Copy on Select`, switch between `Ctrl+Shift+C/V` and browser default copy/paste, and customize new/close tab shortcuts.
 
-Set a theme in your config:
+Clicking **Save Preferences** writes these settings to `~/.gotty/config.yaml`.
 
-```hcl
-preferences {
-    theme = "dracula"
-}
+---
+
+## Documentation
+
+- **[End-to-End Deployment & Container Guide](docs/deployment.md)** — Full deployment walkthrough covering the `gotty-sandbox:latest` container build (`Containerfile`), host user/group setup, systemd configuration, and [Nginx Proxy Manager](https://nginxproxymanager.com/) setup.
+- **[Architecture & Internals](docs/architecture.md)** — How `SessionManager`, the 1MB ring buffer, container vs. host PTY spawning, file transfers, and the preview proxy work.
+- **[Authentication & Security](docs/authentication-and-security.md)** — Reverse-proxy requirement, [Nginx Proxy Manager](https://nginxproxymanager.com/) configuration, `/etc/passwd` and `/etc/group` resolution, and request validation.
+- **[Configuration & Customization](docs/configuration.md)** — Per-user `~/.gotty/config.yaml` schema, UI settings, and server `~/.gotty` HCL configuration.
+- **[CLI Reference](docs/cli-reference.md)** — Command-line flags and environment variables for `gotty` and `godl`.
+
+---
+
+## Development & Testing
+
+```bash
+# Build frontend assets
+cd js && npm install && npm run build && cd ..
+
+# Run Go & Frontend tests
+go test ./...
+cd js && npm test && cd ..
+
+# Compile binaries
+CGO_ENABLED=0 go build -o gotty .
+CGO_ENABLED=0 go build -o godl ./cmd/godl
 ```
 
-You can also override individual colors on top of any theme:
+---
 
-```hcl
-preferences {
-    theme = "nord"
-    foreground_color = "#ffffff"
-    background_color = "#1a1a2e"
-    cursor_color = "#e94560"
-}
-```
+## License
 
-And override entries in the 16-color ANSI palette (ordered: black, red, green, yellow, blue, magenta, cyan, white, brightBlack, brightRed, brightGreen, brightYellow, brightBlue, brightMagenta, brightCyan, brightWhite):
-
-```hcl
-preferences {
-    color_palette_overrides = ["", "", "#00ff00"]
-}
-```
-
-Leave entries empty (`""`) to keep the theme's default.
-
-#### Font Size
-
-Set the terminal font size in pixels (8–48):
-
-```hcl
-preferences {
-    font_size = 16
-}
-```
-
-#### Font Family
-
-Choose a monospace font family:
-
-```hcl
-preferences {
-    font_family = "'JetBrains Mono', monospace"
-}
-```
-
-The runtime picker makes these fonts available: DejaVu Sans Mono,
-JetBrains Mono, Fira Code, Source Code Pro, Monaco, Menlo,
-Cascadia Code, and the system default monospace. Each option in the
-picker renders its name in its own typeface as a live preview.
-
-#### Cursor & Scrollback
-
-```hcl
-preferences {
-    cursor_style = "bar"       // "block" (default), "underline", or "bar"
-    cursor_blink = true
-    scrollback_lines = 5000
-    enable_webgl = true        // enabled by default
-}
-```
-
-#### Alt as Meta Key
-
-For terminal applications that use the Meta modifier (e.g. Emacs), you can
-have the Alt/Option key send an Escape prefix (`M-x` → `\x1b` + `x`):
-
-```hcl
-preferences {
-    alt_is_meta = true
-}
-```
-
-This uses xterm.js's `attachCustomKeyEventHandler` to intercept Alt+key
-combinations before they reach the browser's default handling, and sends
-them as a Meta (Escape) sequence to the terminal. Works on macOS, Linux,
-and Windows.
-
-Letter keys, digits, space, and common punctuation are supported.
-Browser-handled shortcuts like Alt+Tab and Alt+F4 are left alone.
-
-#### Confirm Before Closing the Tab
-
-While a session is connected, GoTTY asks the browser to confirm before the
-page is closed or reloaded. This guards against an accidental Ctrl+W, which
-the browser consumes before the page ever sees it. The guard is dropped as
-soon as the connection closes, so after you exit the shell (for example with
-Ctrl-D) the page closes without a prompt.
-
-```hcl
-confirm_close = true
-```
-
-Set it to `false` (or pass `--confirm-close=false`) to disable the prompt.
-Note that the dialog is drawn by the browser: its wording can't be
-customized, and the browser only shows it once you've interacted with the
-page.
-
-#### Special Keys on Phones and Tablets
-
-Phone keyboards have no Esc, Tab, Ctrl, Alt or arrow keys. On touch
-devices, GoTTY shows a strip of them right above the on-screen keyboard
-while it is open:
-
-```
-Esc   /    -    |   Home  ↑   End  PgUp
-Tab  Ctrl Alt Shift  ←    ↓    →   PgDn
-```
-
-Ctrl, Alt and Shift apply to the next key, typed on either the strip or the
-phone keyboard: tap Ctrl, then type `c` for Ctrl-C, or tap Ctrl, then ← to
-move back a word. Tap a lit modifier again to cancel it. The arrows and
-PgUp/PgDn repeat while held.
-
-The strip appears only when writing is permitted (`--permit-write`), and
-not with a hardware keyboard, which never opens the on-screen one.
-
-```hcl
-mobile_keys = true
-```
-
-Set it to `false` (or pass `--mobile-keys=false`) to turn the strip off.
-
-#### Runtime Picker (🎨 button)
-
-When you open a GoTTY session, a small 🎨 button appears in the
-bottom-right corner. Click it to open a floating settings panel where
-you can switch themes, adjust font size, and change font family on the
-fly. All your choices are saved to `localStorage` and restored
-automatically on your next visit. The panel stays open while you tweak
-multiple settings and closes when you click outside it.
-
-> **Note**: Runtime picker settings override config defaults for your
-> current browser. Config preferences are re-applied on fresh connections
-> (new browser, cleared storage, incognito mode).
-
-### Security Options
-
-By default, GoTTY doesn't allow clients to send any keystrokes or commands except terminal window resizing. When you want to permit clients to write input to the TTY, add the `-w` option. However, accepting input from remote clients is dangerous for most commands. When you need interaction with the TTY for some reasons, consider starting GoTTY with tmux or GNU Screen and run your command on it (see "Sharing with Multiple Clients" section for detail).
-
-To restrict client access, you can use the `-c` option to enable the basic authentication. With this option, clients need to input the specified username and password to connect to the GoTTY server. Note that the credentials will be transmitted between the server and clients in plain text. For more strict authentication, consider the SSL/TLS client certificate authentication described below.
-
-The `-r` option is a little bit more casual way to restrict access. With this option, GoTTY generates a random URL so that only people who know the URL can get access to the server.
-
-All traffic between the server and clients are NOT encrypted by default. When you send secret information through GoTTY, we strongly recommend you use the `-t` option which enables TLS/SSL on the session. By default, GoTTY loads the crt and key files placed at `~/.gotty.crt` and `~/.gotty.key`. You can overwrite these file paths with the `--tls-crt` and `--tls-key` options. When you need to generate a self-signed certification file, you can use the `openssl` command.
-
-```sh
-openssl req -x509 -nodes -days 9999 -newkey rsa:2048 -keyout ~/.gotty.key -out ~/.gotty.crt
-```
-
-(NOTE: For Safari uses, see [how to enable self-signed certificates for WebSockets](http://blog.marcon.me/post/24874118286/secure-websockets-safari) when use self-signed certificates)
-
-For additional security, you can use the SSL/TLS client certificate authentication by providing a CA certificate file to the `--tls-ca-crt` option (this option requires the `-t` or `--tls` to be set). This option requires all clients to send valid client certificates that are signed by the specified certification authority.
-
-## Running behind a reverse proxy
-
-GoTTY speaks HTTP/1.1, so its WebSocket is an ordinary RFC6455 `Upgrade` on that connection. If your edge serves the browser over HTTP/2 it must translate the upgrade down to HTTP/1.1 for the GoTTY hop — GoTTY never sees HTTP/2, so RFC8441 support would not change anything. A page that loads while the terminal stays black is almost always the upgrade not completing at the edge.
-
-- **Check the handshake.** In devtools → Network, the `…/ws` request should be **101 Switching Protocols**. A `403`, or a plain HTTP response, means the proxy treated it as an ordinary request: forward `Upgrade` and `Connection: upgrade`, and don't buffer that route.
-- **Check `Host` and `Origin`.** Without `--ws-origin`, GoTTY refuses cross-origin handshakes by default, so the browser's `Origin` must match the `Host` GoTTY sees. An edge that rewrites `Host` — or a GoTTY on a loopback address or unix socket — breaks the match. Preserve the original `Host` (nginx: `proxy_set_header Host $host;`; Caddy does it by default) and/or set `--ws-origin '^https://terminal\.example\.com$'`.
-
-Under a subpath, the proxy must not strip the prefix; keep it in sync with `--path`.
-
-## Sharing with Multiple Clients
-
-GoTTY starts a new process with the given command when a new client connects to the server. This means users cannot share a single terminal with others by default. However, you can use terminal multiplexers for sharing a single process with multiple clients.
-### Screen
-After installing GNU screen, start a new session with `screen -S name-for-session` and connect to it with gotty in another terminal window/tab through `screen -x name-for-session`. All commands and activities being done in the first terminal tab/window will now be broadcasted by gotty.
-### Tmux
-For example, you can start a new tmux session named `gotty` with `top` command by the command below.
-
-```sh
-$ gotty tmux new -A -s gotty top
-```
-
-This command doesn't allow clients to send keystrokes, however, you can attach the session from your local terminal and run operations like switching the mode of the `top` command. To connect to the tmux session from your terminal, you can use following command.
-
-```sh
-$ tmux new -A -s gotty
-```
-
-By using terminal multiplexers, you can have the control of your terminal and allow clients to just see your screen.
-
-### Quick Sharing on tmux
-
-To share your current session with others by a shortcut key, you can add a line like below to your `.tmux.conf`.
-
-```
-# Start GoTTY in a new window with C-t
-bind-key C-t new-window "gotty tmux attach -t `tmux display -p '#S'`"
-```
-
-## Playing with Docker
-
-When you want to create a jailed environment for each client, you can use Docker containers like following:
-
-```sh
-$ gotty -w docker run -it --rm busybox
-```
-
-## Development
-
-You can build a binary by simply running `make`. go1.16 is required.
-
-To build the frontend part (JS files and other static files), you need `npm`.
-
-## Architecture
-
-GoTTY uses [xterm.js](https://xtermjs.org/) to run a JavaScript based terminal on web browsers. GoTTY itself provides a websocket server that simply relays output from the TTY to clients and receives input from clients and forwards it to the TTY. This xterm + websocket idea is inspired by [Wetty](https://github.com/krishnasrinivas/wetty).
-
-## Alternatives
-
-### Command line client
-
-* [gotty-client](https://github.com/moul/gotty-client): If you want to connect to GoTTY server from your terminal
-
-### Terminal/SSH on Web Browsers
-
-* [Secure Shell (Chrome App)](https://chrome.google.com/webstore/detail/secure-shell/pnhechapfaindjhompbnflcldabbghjo): If you are a chrome user and need a "real" SSH client on your web browser, perhaps the Secure Shell app is what you want
-* [Wetty](https://github.com/krishnasrinivas/wetty): Node based web terminal (SSH/login)
-* [ttyd](https://tsl0922.github.io/ttyd): C port of GoTTY with CJK and IME support
-
-### Terminal Sharing
-
-* [tmate](http://tmate.io/): Forked-Tmux based Terminal-Terminal sharing
-* [termshare](https://termsha.re): Terminal-Terminal sharing through a HTTP server
-* [tmux](https://tmux.github.io/): Tmux itself also supports TTY sharing through SSH)
-
-# License
-
-The MIT License
-
-# Contributors
-
-Thanks goes to these wonderful people ([emoji key](https://allcontributors.org/docs/en/emoji-key)):
-
-<!-- ALL-CONTRIBUTORS-LIST:START - Do not remove or modify this section -->
-<!-- prettier-ignore-start -->
-<!-- markdownlint-disable -->
-<table>
-  <tbody>
-    <tr>
-      <td align="center" valign="top" width="14.28%"><a href="https://yudai.arielworks.com/"><img src="https://avatars.githubusercontent.com/u/33192?v=4?s=100" width="100px;" alt="Iwasaki Yudai"/><br /><sub><b>Iwasaki Yudai</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=yudai" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="http://linux2go.dk/"><img src="https://avatars.githubusercontent.com/u/160090?v=4?s=100" width="100px;" alt="Soren L. Hansen"/><br /><sub><b>Soren L. Hansen</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3Asorenisanerd" title="Bug reports">🐛</a> <a href="https://github.com/sorenisanerd/gotty/commits?author=sorenisanerd" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/uovobw"><img src="https://avatars.githubusercontent.com/u/1194751?v=4?s=100" width="100px;" alt="Andrea Lusuardi"/><br /><sub><b>Andrea Lusuardi</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=uovobw" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/moul"><img src="https://avatars.githubusercontent.com/u/94029?v=4?s=100" width="100px;" alt="Manfred Touron"/><br /><sub><b>Manfred Touron</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=moul" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/svanellewee"><img src="https://avatars.githubusercontent.com/u/1567439?v=4?s=100" width="100px;" alt="Stephan"/><br /><sub><b>Stephan</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=svanellewee" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://fr.linkedin.com/in/quentinperez"><img src="https://avatars.githubusercontent.com/u/3081204?v=4?s=100" width="100px;" alt="Quentin Perez"/><br /><sub><b>Quentin Perez</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=QuentinPerez" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/jizhilong"><img src="https://avatars.githubusercontent.com/u/816618?v=4?s=100" width="100px;" alt="jzl"/><br /><sub><b>jzl</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=jizhilong" title="Code">💻</a></td>
-    </tr>
-    <tr>
-      <td align="center" valign="top" width="14.28%"><a href="https://majid.info/"><img src="https://avatars.githubusercontent.com/u/331198?v=4?s=100" width="100px;" alt="Fazal Majid"/><br /><sub><b>Fazal Majid</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=fazalmajid" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://narrationbox.com/"><img src="https://avatars.githubusercontent.com/u/7126128?v=4?s=100" width="100px;" alt="Immortalin"/><br /><sub><b>Immortalin</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=Immortalin" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/freakhill"><img src="https://avatars.githubusercontent.com/u/916582?v=4?s=100" width="100px;" alt="freakhill"/><br /><sub><b>freakhill</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=freakhill" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/0xflotus"><img src="https://avatars.githubusercontent.com/u/26602940?v=4?s=100" width="100px;" alt="0xflotus"/><br /><sub><b>0xflotus</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=0xflotus" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://andy.blog/"><img src="https://avatars.githubusercontent.com/u/52292?v=4?s=100" width="100px;" alt="Andy Skelton"/><br /><sub><b>Andy Skelton</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=skeltoac" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://twitter.com/artdevjs"><img src="https://avatars.githubusercontent.com/u/7567983?v=4?s=100" width="100px;" alt="Artem Medvedev"/><br /><sub><b>Artem Medvedev</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=artdevjs" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/blakejennings"><img src="https://avatars.githubusercontent.com/u/1976331?v=4?s=100" width="100px;" alt="Blake Jennings"/><br /><sub><b>Blake Jennings</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=blakejennings" title="Code">💻</a></td>
-    </tr>
-    <tr>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/jensenbox"><img src="https://avatars.githubusercontent.com/u/189265?v=4?s=100" width="100px;" alt="Christian Jensen"/><br /><sub><b>Christian Jensen</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=jensenbox" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://wilk.tech/"><img src="https://avatars.githubusercontent.com/u/9367803?v=4?s=100" width="100px;" alt="Christopher Wilkinson"/><br /><sub><b>Christopher Wilkinson</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=TechWilk" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/RealCyGuy"><img src="https://avatars.githubusercontent.com/u/54488650?v=4?s=100" width="100px;" alt="Cyrus"/><br /><sub><b>Cyrus</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=RealCyGuy" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/dehorsley"><img src="https://avatars.githubusercontent.com/u/3401668?v=4?s=100" width="100px;" alt="David Horsley"/><br /><sub><b>David Horsley</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=dehorsley" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://jasoncooke.dev/"><img src="https://avatars.githubusercontent.com/u/5185660?v=4?s=100" width="100px;" alt="Jason Cooke"/><br /><sub><b>Jason Cooke</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=Jason-Cooke" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/DenKoren"><img src="https://avatars.githubusercontent.com/u/3419381?v=4?s=100" width="100px;" alt="Denis Korenevskiy"/><br /><sub><b>Denis Korenevskiy</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=DenKoren" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://www.stucchi.ch/"><img src="https://avatars.githubusercontent.com/u/1331438?v=4?s=100" width="100px;" alt="Massimiliano Stucchi"/><br /><sub><b>Massimiliano Stucchi</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=stucchimax" title="Code">💻</a></td>
-    </tr>
-    <tr>
-      <td align="center" valign="top" width="14.28%"><a href="https://www.linkedin.com/in/felixoid/"><img src="https://avatars.githubusercontent.com/u/3025537?v=4?s=100" width="100px;" alt="Mikhail f. Shiryaev"/><br /><sub><b>Mikhail f. Shiryaev</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=Felixoid" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/guywithnose"><img src="https://avatars.githubusercontent.com/u/1059169?v=4?s=100" width="100px;" alt="Robert Bittle"/><br /><sub><b>Robert Bittle</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=guywithnose" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://deebas.com/"><img src="https://avatars.githubusercontent.com/u/283482?v=4?s=100" width="100px;" alt="sebastian haas"/><br /><sub><b>sebastian haas</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=sehaas" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/shoz"><img src="https://avatars.githubusercontent.com/u/225194?v=4?s=100" width="100px;" alt="shoji"/><br /><sub><b>shoji</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=shoz" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/tsl0922"><img src="https://avatars.githubusercontent.com/u/1680515?v=4?s=100" width="100px;" alt="Shuanglei Tao"/><br /><sub><b>Shuanglei Tao</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=tsl0922" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://gitter.im/"><img src="https://avatars.githubusercontent.com/u/8518239?v=4?s=100" width="100px;" alt="The Gitter Badger"/><br /><sub><b>The Gitter Badger</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=gitter-badger" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/xinsnake"><img src="https://avatars.githubusercontent.com/u/1287677?v=4?s=100" width="100px;" alt="Jacob Zhou"/><br /><sub><b>Jacob Zhou</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=xinsnake" title="Code">💻</a></td>
-    </tr>
-    <tr>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/zyfdegh"><img src="https://avatars.githubusercontent.com/u/7880217?v=4?s=100" width="100px;" alt="zyfdegh"/><br /><sub><b>zyfdegh</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=zyfdegh" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/fredster33"><img src="https://avatars.githubusercontent.com/u/64927044?v=4?s=100" width="100px;" alt="fredster33"/><br /><sub><b>fredster33</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=fredster33" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://mattn.kaoriya.net/"><img src="https://avatars.githubusercontent.com/u/10111?v=4?s=100" width="100px;" alt="mattn"/><br /><sub><b>mattn</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=mattn" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://www.shingt.com/"><img src="https://avatars.githubusercontent.com/u/1391330?v=4?s=100" width="100px;" alt="Shinichi Goto"/><br /><sub><b>Shinichi Goto</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=shingt" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://twitter.com/_yogeshsingh"><img src="https://avatars.githubusercontent.com/u/8512357?v=4?s=100" width="100px;" alt="ygit"/><br /><sub><b>ygit</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=ygit" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="http://forum.cachem.fr/viewforum.php?f=21"><img src="https://avatars.githubusercontent.com/u/3392684?v=4?s=100" width="100px;" alt="Stéphane"/><br /><sub><b>Stéphane</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3Anephaste" title="Bug reports">🐛</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://rusnak.io/"><img src="https://avatars.githubusercontent.com/u/42201?v=4?s=100" width="100px;" alt="Pavol Rusnak"/><br /><sub><b>Pavol Rusnak</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3Aprusnak" title="Bug reports">🐛</a> <a href="https://github.com/sorenisanerd/gotty/commits?author=prusnak" title="Code">💻</a></td>
-    </tr>
-    <tr>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/devanlai"><img src="https://avatars.githubusercontent.com/u/1348448?v=4?s=100" width="100px;" alt="Devan Lai"/><br /><sub><b>Devan Lai</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=devanlai" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/jkandasa"><img src="https://avatars.githubusercontent.com/u/1004403?v=4?s=100" width="100px;" alt="Jeeva Kandasamy"/><br /><sub><b>Jeeva Kandasamy</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=jkandasa" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://twitch.tv/iamhardliner"><img src="https://avatars.githubusercontent.com/u/2937272?v=4?s=100" width="100px;" alt="Steve Biedermann"/><br /><sub><b>Steve Biedermann</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=hardliner66" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/xgdgsc"><img src="https://avatars.githubusercontent.com/u/1189869?v=4?s=100" width="100px;" alt="xgdgsc"/><br /><sub><b>xgdgsc</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3Axgdgsc" title="Bug reports">🐛</a> <a href="https://github.com/sorenisanerd/gotty/commits?author=xgdgsc" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/flechaig"><img src="https://avatars.githubusercontent.com/u/10887132?v=4?s=100" width="100px;" alt="flechaig"/><br /><sub><b>flechaig</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3Aflechaig" title="Bug reports">🐛</a> <a href="https://github.com/sorenisanerd/gotty/commits?author=flechaig" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/Fan-SJ"><img src="https://avatars.githubusercontent.com/u/49977708?v=4?s=100" width="100px;" alt="Fan-SJ"/><br /><sub><b>Fan-SJ</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3AFan-SJ" title="Bug reports">🐛</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/dmartin"><img src="https://avatars.githubusercontent.com/u/1657652?v=4?s=100" width="100px;" alt="Dustin Martin"/><br /><sub><b>Dustin Martin</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3Admartin" title="Bug reports">🐛</a></td>
-    </tr>
-    <tr>
-      <td align="center" valign="top" width="14.28%"><a href="https://ahmet.dev/"><img src="https://avatars.githubusercontent.com/u/159209?v=4?s=100" width="100px;" alt="Ahmet Alp Balkan"/><br /><sub><b>Ahmet Alp Balkan</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3Aahmetb" title="Bug reports">🐛</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/CoconutMacaroon"><img src="https://avatars.githubusercontent.com/u/45187468?v=4?s=100" width="100px;" alt="CoconutMacaroon"/><br /><sub><b>CoconutMacaroon</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3ACoconutMacaroon" title="Bug reports">🐛</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.dannyben.com/"><img src="https://avatars.githubusercontent.com/u/2405099?v=4?s=100" width="100px;" alt="Danny Ben Shitrit"/><br /><sub><b>Danny Ben Shitrit</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3ADannyBen" title="Bug reports">🐛</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/George-NG"><img src="https://avatars.githubusercontent.com/u/28577165?v=4?s=100" width="100px;" alt="George-NG"/><br /><sub><b>George-NG</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3AGeorge-NG" title="Bug reports">🐛</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/ghthor"><img src="https://avatars.githubusercontent.com/u/160298?v=4?s=100" width="100px;" alt="Will Owens"/><br /><sub><b>Will Owens</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3Aghthor" title="Bug reports">🐛</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://jpillora.com/"><img src="https://avatars.githubusercontent.com/u/633843?v=4?s=100" width="100px;" alt="Jaime Pillora"/><br /><sub><b>Jaime Pillora</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3Ajpillora" title="Bug reports">🐛</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/kaisawind"><img src="https://avatars.githubusercontent.com/u/4010613?v=4?s=100" width="100px;" alt="kaisawind"/><br /><sub><b>kaisawind</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3Akaisawind" title="Bug reports">🐛</a></td>
-    </tr>
-    <tr>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/linyinli"><img src="https://avatars.githubusercontent.com/u/42955482?v=4?s=100" width="100px;" alt="linyinli"/><br /><sub><b>linyinli</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3Alinyinli" title="Bug reports">🐛</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/LucaMarconato"><img src="https://avatars.githubusercontent.com/u/2664412?v=4?s=100" width="100px;" alt="LucaMarconato"/><br /><sub><b>LucaMarconato</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3ALucaMarconato" title="Bug reports">🐛</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://audiobox.fm/"><img src="https://avatars.githubusercontent.com/u/12844?v=4?s=100" width="100px;" alt="Kain"/><br /><sub><b>Kain</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3Amasterkain" title="Bug reports">🐛</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="http://duro.me/"><img src="https://avatars.githubusercontent.com/u/1498061?v=4?s=100" width="100px;" alt="Andi Andreas"/><br /><sub><b>Andi Andreas</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3ANexuist" title="Bug reports">🐛</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/qigj"><img src="https://avatars.githubusercontent.com/u/56585735?v=4?s=100" width="100px;" alt="qigj"/><br /><sub><b>qigj</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3Aqigj" title="Bug reports">🐛</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/shuaiyy"><img src="https://avatars.githubusercontent.com/u/19821321?v=4?s=100" width="100px;" alt="shuaiyy"/><br /><sub><b>shuaiyy</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3Ashuaiyy" title="Bug reports">🐛</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/v20z"><img src="https://avatars.githubusercontent.com/u/2884824?v=4?s=100" width="100px;" alt="v20z"/><br /><sub><b>v20z</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3Av20z" title="Bug reports">🐛</a></td>
-    </tr>
-    <tr>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/Yann-Qiu"><img src="https://avatars.githubusercontent.com/u/56961747?v=4?s=100" width="100px;" alt="Yanfeng Qiu"/><br /><sub><b>Yanfeng Qiu</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3AYann-Qiu" title="Bug reports">🐛</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/0xcanary"><img src="https://avatars.githubusercontent.com/u/129939236?v=4?s=100" width="100px;" alt="0xcanary"/><br /><sub><b>0xcanary</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3A0xcanary" title="Bug reports">🐛</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/alirezafarnoosh"><img src="https://avatars.githubusercontent.com/u/47647930?v=4?s=100" width="100px;" alt="alirezafarnoosh"/><br /><sub><b>alirezafarnoosh</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3Aalirezafarnoosh" title="Bug reports">🐛</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/alphajoza"><img src="https://avatars.githubusercontent.com/u/16447592?v=4?s=100" width="100px;" alt="alphajoza"/><br /><sub><b>alphajoza</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3Aalphajoza" title="Bug reports">🐛</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/dillfrescott"><img src="https://avatars.githubusercontent.com/u/56714680?v=4?s=100" width="100px;" alt="Cross Nastasi"/><br /><sub><b>Cross Nastasi</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3Adillfrescott" title="Bug reports">🐛</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="http://nathguil.free.fr/"><img src="https://avatars.githubusercontent.com/u/47187?v=4?s=100" width="100px;" alt="Guilhem Bonnefille"/><br /><sub><b>Guilhem Bonnefille</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3Aguyou" title="Bug reports">🐛</a> <a href="https://github.com/sorenisanerd/gotty/commits?author=guyou" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/huiwq1990"><img src="https://avatars.githubusercontent.com/u/4555057?v=4?s=100" width="100px;" alt="huiwq1990"/><br /><sub><b>huiwq1990</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3Ahuiwq1990" title="Bug reports">🐛</a></td>
-    </tr>
-    <tr>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/imcnanie"><img src="https://avatars.githubusercontent.com/u/4652417?v=4?s=100" width="100px;" alt="imcnanie"/><br /><sub><b>imcnanie</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3Aimcnanie" title="Bug reports">🐛</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/josegonzalez"><img src="https://avatars.githubusercontent.com/u/65675?v=4?s=100" width="100px;" alt="Jose Diaz-Gonzalez"/><br /><sub><b>Jose Diaz-Gonzalez</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3Ajosegonzalez" title="Bug reports">🐛</a> <a href="https://github.com/sorenisanerd/gotty/commits?author=josegonzalez" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/Loccy"><img src="https://avatars.githubusercontent.com/u/120780?v=4?s=100" width="100px;" alt="Loccy"/><br /><sub><b>Loccy</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3ALoccy" title="Bug reports">🐛</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/mrinalwahal"><img src="https://avatars.githubusercontent.com/u/9859731?v=4?s=100" width="100px;" alt="Mrinal Wahal"/><br /><sub><b>Mrinal Wahal</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3Amrinalwahal" title="Bug reports">🐛</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/stevelaclasse"><img src="https://avatars.githubusercontent.com/u/29569191?v=4?s=100" width="100px;" alt="stevelaclasse"/><br /><sub><b>stevelaclasse</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/issues?q=author%3Astevelaclasse" title="Bug reports">🐛</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/180909"><img src="https://avatars.githubusercontent.com/u/70465953?v=4?s=100" width="100px;" alt="180909"/><br /><sub><b>180909</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=180909" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/benoittgt"><img src="https://avatars.githubusercontent.com/u/8417720?v=4?s=100" width="100px;" alt="Benoit Tigeot"/><br /><sub><b>Benoit Tigeot</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=benoittgt" title="Code">💻</a></td>
-    </tr>
-    <tr>
-      <td align="center" valign="top" width="14.28%"><a href="https://callum.gare.au/"><img src="https://avatars.githubusercontent.com/u/346340?v=4?s=100" width="100px;" alt="Callum Gare"/><br /><sub><b>Callum Gare</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=callumgare" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/devnull"><img src="https://avatars.githubusercontent.com/u/56172?v=4?s=100" width="100px;" alt="Mike Bentzen"/><br /><sub><b>Mike Bentzen</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=devnull" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/funnywwh"><img src="https://avatars.githubusercontent.com/u/4208460?v=4?s=100" width="100px;" alt="zigger"/><br /><sub><b>zigger</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=funnywwh" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/llaoj"><img src="https://avatars.githubusercontent.com/u/17629142?v=4?s=100" width="100px;" alt="老J"/><br /><sub><b>老J</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=llaoj" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://lach.dev/"><img src="https://avatars.githubusercontent.com/u/5011490?v=4?s=100" width="100px;" alt="Łukasz Lach"/><br /><sub><b>Łukasz Lach</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=lukaszlach" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/nuttingd"><img src="https://avatars.githubusercontent.com/u/1181562?v=4?s=100" width="100px;" alt="David Nutting"/><br /><sub><b>David Nutting</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=nuttingd" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/rlmcpherson"><img src="https://avatars.githubusercontent.com/u/1706273?v=4?s=100" width="100px;" alt="Randall McPherson"/><br /><sub><b>Randall McPherson</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=rlmcpherson" title="Code">💻</a></td>
-    </tr>
-    <tr>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/sagar-salvi-unskript"><img src="https://avatars.githubusercontent.com/u/95602213?v=4?s=100" width="100px;" alt="sagar-salvi-unskript"/><br /><sub><b>sagar-salvi-unskript</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=sagar-salvi-unskript" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/uddmorningsun"><img src="https://avatars.githubusercontent.com/u/19144683?v=4?s=100" width="100px;" alt="uddmorningsun"/><br /><sub><b>uddmorningsun</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=uddmorningsun" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/a2800276"><img src="https://avatars.githubusercontent.com/u/35631?v=4?s=100" width="100px;" alt="Tim Becker"/><br /><sub><b>Tim Becker</b></sub></a><br /><a href="https://github.com/sorenisanerd/gotty/commits?author=a2800276" title="Code">💻</a></td>
-    </tr>
-  </tbody>
-</table>
-
-<!-- markdownlint-restore -->
-<!-- prettier-ignore-end -->
-
-<!-- ALL-CONTRIBUTORS-LIST:END -->
-
-This project follows the [all-contributors](https://github.com/all-contributors/all-contributors) specification. Contributions of any kind welcome!
+Released under the [MIT License](LICENSE).
