@@ -65,6 +65,7 @@ func BuildContainerArgs(user *auth.UserIdentity, containerName string, image str
 		"run", "-it", "--rm",
 		"--name", containerName,
 		"--pids-limit=512",
+		"--shm-size=512m",
 		"--cap-drop=MKNOD",
 		"--cap-drop=SYS_ADMIN",
 		"--cap-drop=SYS_MODULE",

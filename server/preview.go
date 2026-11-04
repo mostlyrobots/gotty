@@ -368,10 +368,23 @@ func dialInContainerNetNS(ctx context.Context, containerPID int, network, addr s
 		}
 
 		dialer := &net.Dialer{
-			Timeout:   5 * time.Second,
-			KeepAlive: 30 * time.Second,
+			Timeout:       5 * time.Second,
+			KeepAlive:     30 * time.Second,
+			FallbackDelay: -1, // Disable Happy Eyeballs sub-goroutine so dial stays on this locked OS thread
 		}
-		conn, dialErr := dialer.DialContext(ctx, network, addr)
+		var conn net.Conn
+		var dialErr error
+		if h, p, splitErr := net.SplitHostPort(addr); splitErr == nil && strings.EqualFold(h, "localhost") {
+			conn, dialErr = dialer.DialContext(ctx, "tcp4", net.JoinHostPort("127.0.0.1", p))
+			if dialErr != nil {
+				if conn6, err6 := dialer.DialContext(ctx, "tcp6", net.JoinHostPort("::1", p)); err6 == nil {
+					conn = conn6
+					dialErr = nil
+				}
+			}
+		} else {
+			conn, dialErr = dialer.DialContext(ctx, network, addr)
+		}
 
 		// Restore host netns before unlocking OS thread; if restore fails, do NOT unlock so the thread terminates.
 		if _, _, errno := syscall.Syscall(sysSetnsNum(), origNS.Fd(), cloneNewNet, 0); errno != 0 {
@@ -590,7 +603,7 @@ func (server *Server) handleAPIPreview(w http.ResponseWriter, r *http.Request) {
 // resolvePreviewContainerPID returns the container PID to dial inside when previewing a target.
 // For sandboxed users (!user.IsHostAccess), host loopback is never exposed when container runtime
 // or a container session is present.
-func (server *Server) resolvePreviewContainerPID(user *auth.UserIdentity, host string) (int, error) {
+func (server *Server) resolvePreviewContainerPID(user *auth.UserIdentity, host string, port int) (int, error) {
 	if user == nil || server.sessionManager == nil {
 		return 0, nil
 	}
@@ -605,9 +618,15 @@ func (server *Server) resolvePreviewContainerPID(user *auth.UserIdentity, host s
 		return 0, nil
 	}
 	// Host-authorized user: if previewing localhost and they have an active sandbox container,
-	// prefer host loopback if listening, otherwise fall back to their sandbox container's netns.
-	if pid > 0 && isLoopbackHost(host) {
-		return 0, nil
+	// check if the port is listening inside their sandbox container; if so, route into the sandbox netns.
+	if pid > 0 && isLoopbackHost(host) && port > 0 {
+		targetAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+		if conn, err := dialInContainerNetNS(ctx, pid, "tcp", targetAddr); err == nil {
+			_ = conn.Close()
+			return pid, nil
+		}
 	}
 	return 0, nil
 }
@@ -684,7 +703,7 @@ func (server *Server) handlePreviewProxy(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	containerPID, err := server.resolvePreviewContainerPID(user, host)
+	containerPID, err := server.resolvePreviewContainerPID(user, host, port)
 	if err != nil {
 		http.Error(w, "502 Bad Gateway: "+err.Error(), http.StatusBadGateway)
 		return
@@ -742,7 +761,7 @@ func (server *Server) tryPreviewFallback(w http.ResponseWriter, r *http.Request,
 							http.Error(w, "403 Forbidden: preview host is not permitted for your privilege level", http.StatusForbidden)
 							return true
 						}
-						containerPID, err := server.resolvePreviewContainerPID(user, h)
+						containerPID, err := server.resolvePreviewContainerPID(user, h, p)
 						if err != nil {
 							http.Error(w, "502 Bad Gateway: "+err.Error(), http.StatusBadGateway)
 							return true
@@ -766,7 +785,7 @@ func (server *Server) tryPreviewFallback(w http.ResponseWriter, r *http.Request,
 					http.Error(w, "403 Forbidden: preview host is not permitted for your privilege level", http.StatusForbidden)
 					return true
 				}
-				containerPID, err := server.resolvePreviewContainerPID(user, host)
+				containerPID, err := server.resolvePreviewContainerPID(user, host, port)
 				if err != nil {
 					http.Error(w, "502 Bad Gateway: "+err.Error(), http.StatusBadGateway)
 					return true

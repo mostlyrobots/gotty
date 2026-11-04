@@ -323,8 +323,16 @@ func (server *Server) setupHandlers(ctx context.Context, cancel context.CancelFu
 		siteHandler = server.wrapBasicAuth(siteHandler, server.options.Credential)
 	}
 
-	withGz := gziphandler.GzipHandler(server.wrapHeaders(siteHandler))
-	siteHandler = server.wrapLogger(withGz)
+	wrappedHeaders := server.wrapHeaders(siteHandler)
+	withGz := gziphandler.GzipHandler(wrappedHeaders)
+	wsSafeGz := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			wrappedHeaders.ServeHTTP(w, r)
+			return
+		}
+		withGz.ServeHTTP(w, r)
+	})
+	siteHandler = server.wrapLogger(wsSafeGz)
 
 	previewPrefix := pathPrefix + "preview/"
 	previewHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
