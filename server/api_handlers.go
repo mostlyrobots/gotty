@@ -31,7 +31,8 @@ var IdentityHeaders = []string{
 }
 
 // resolveRequestUser extracts the identity from proxy headers (when EnableProxyAuth is active)
-// or falls back to DefaultUser.
+// or falls back to DefaultUser. If multiple proxy identity headers are present with conflicting
+// non-empty values, it rejects the request to prevent header-priority smuggling.
 func (server *Server) resolveRequestUser(r *http.Request) (string, string) {
 	if server.options.EnableProxyAuth {
 		if customHeader := strings.TrimSpace(server.options.ProxyAuthHeader); customHeader != "" {
@@ -39,11 +40,22 @@ func (server *Server) resolveRequestUser(r *http.Request) (string, string) {
 				return val, customHeader
 			}
 		} else {
+			var matchedVal, matchedHeader string
 			for _, h := range IdentityHeaders {
 				val := strings.TrimSpace(r.Header.Get(h))
-				if val != "" {
-					return val, h
+				if val == "" {
+					continue
 				}
+				if matchedVal == "" {
+					matchedVal = val
+					matchedHeader = h
+				} else if !strings.EqualFold(matchedVal, val) {
+					log.Printf("auth: conflicting proxy identity headers %s=%q and %s=%q", matchedHeader, matchedVal, h, val)
+					return "", "conflicting-headers"
+				}
+			}
+			if matchedVal != "" {
+				return matchedVal, matchedHeader
 			}
 		}
 	}
@@ -51,6 +63,21 @@ func (server *Server) resolveRequestUser(r *http.Request) (string, string) {
 		return server.options.DefaultUser, "default-user"
 	}
 	return "", ""
+}
+
+// isFromPreviewReferer returns true if the request's Referer header indicates it originated
+// from a previewed web application under /preview/ (preventing same-origin preview JS from
+// calling GoTTY control plane endpoints).
+func isFromPreviewReferer(r *http.Request) bool {
+	ref := strings.TrimSpace(r.Header.Get("Referer"))
+	if ref == "" {
+		return false
+	}
+	u, err := url.Parse(ref)
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(u.Path, "/preview/") || strings.Contains(u.Path, "/preview/")
 }
 
 // hasProxyIdentity returns true if proxy auth is enabled and an identity header is present in the request.
@@ -69,9 +96,23 @@ func (server *Server) hasProxyIdentity(r *http.Request) bool {
 	return false
 }
 
+// isControlPlanePath returns true if urlPath targets a GoTTY control-plane endpoint.
+func isControlPlanePath(urlPath string) bool {
+	return strings.Contains(urlPath, "/api/sessions") ||
+		strings.Contains(urlPath, "/api/user/config") ||
+		strings.Contains(urlPath, "/api/preview") ||
+		strings.HasSuffix(urlPath, "/ws") ||
+		strings.HasSuffix(urlPath, "/auth_token.js")
+}
+
 // authenticateRequest resolves the user against the server's passwd/group resolver.
-// Writes 403 Forbidden and returns nil if missing, cross-origin, or unmapped.
+// Writes 403 Forbidden and returns nil if missing, cross-origin, from preview context, or unmapped.
 func (server *Server) authenticateRequest(w http.ResponseWriter, r *http.Request) *auth.UserIdentity {
+	if isFromPreviewReferer(r) && isControlPlanePath(r.URL.Path) {
+		http.Error(w, "403 Forbidden: control plane access from preview context is blocked", http.StatusForbidden)
+		return nil
+	}
+
 	if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
 		if !checkSameOrigin(r) {
 			http.Error(w, "403 Forbidden: cross-origin request rejected", http.StatusForbidden)
@@ -80,6 +121,10 @@ func (server *Server) authenticateRequest(w http.ResponseWriter, r *http.Request
 	}
 
 	identityVal, source := server.resolveRequestUser(r)
+	if source == "conflicting-headers" {
+		http.Error(w, "403 Forbidden: conflicting identity headers in request", http.StatusForbidden)
+		return nil
+	}
 	if identityVal == "" {
 		log.Printf("auth: missing identity (checked %v, default-user=%q)", IdentityHeaders, server.options.DefaultUser)
 		http.Error(w, "403 Forbidden: unmapped or missing identity header (e.g. X-Forwarded-User, Remote-User, X-Forwarded-Email)", http.StatusForbidden)
@@ -270,7 +315,13 @@ func (server *Server) handleAPISessionUpload(w http.ResponseWriter, r *http.Requ
 
 	var writtenPath string
 	if cwd, err := sess.ResolveCWD(); err == nil && cwd != "" {
-		if isSafeUploadDir(cwd, fallbackDir, sess.IsHostAccess) {
+		if rel, withinHome := resolveRelativeToHome(cwd, fallbackDir); withinHome {
+			if candidate, err := writeUploadedFileUnderRoot(fallbackDir, rel, filename, file, user); err == nil {
+				writtenPath = candidate
+			} else {
+				_, _ = file.Seek(0, io.SeekStart)
+			}
+		} else if sess.IsHostAccess && sess.Mode == "host" && isSafeUploadDir(cwd, fallbackDir, true) {
 			if candidate, err := writeUploadedFileInDir(cwd, filename, file, user); err == nil {
 				writtenPath = candidate
 			} else {
@@ -281,13 +332,17 @@ func (server *Server) handleAPISessionUpload(w http.ResponseWriter, r *http.Requ
 
 	// 2. Fallback to user's HomeDir (/home/<username>/)
 	if writtenPath == "" {
-		_, statErr := os.Stat(fallbackDir)
-		if err := os.MkdirAll(fallbackDir, 0755); err == nil && os.IsNotExist(statErr) {
-			if user != nil && os.Geteuid() == 0 && user.UID > 0 {
-				_ = os.Chown(fallbackDir, int(user.UID), int(user.GID))
+		if fi, statErr := os.Lstat(fallbackDir); os.IsNotExist(statErr) {
+			if err := os.MkdirAll(fallbackDir, 0755); err == nil {
+				if user != nil && os.Geteuid() == 0 && user.UID > 0 {
+					_ = os.Chown(fallbackDir, int(user.UID), int(user.GID))
+				}
 			}
+		} else if statErr == nil && fi.Mode()&os.ModeSymlink != 0 {
+			http.Error(w, "Refusing to write to symlinked home directory", http.StatusForbidden)
+			return
 		}
-		candidate, err := writeUploadedFileInDir(fallbackDir, filename, file, user)
+		candidate, err := writeUploadedFileUnderRoot(fallbackDir, ".", filename, file, user)
 		if err != nil {
 			http.Error(w, "Failed to write file to CWD or HOME: "+err.Error(), http.StatusInternalServerError)
 			return
@@ -302,13 +357,10 @@ func (server *Server) handleAPISessionUpload(w http.ResponseWriter, r *http.Requ
 	})
 }
 
-func isSafeUploadDir(cwd, homeDir string, isHostAccess bool) bool {
+func resolveRelativeToHome(cwd, homeDir string) (string, bool) {
 	realCWD, err := filepath.EvalSymlinks(cwd)
 	if err != nil {
-		return false
-	}
-	if isHostAccess {
-		return true
+		return "", false
 	}
 	realHome, err := filepath.EvalSymlinks(homeDir)
 	if err != nil {
@@ -316,33 +368,73 @@ func isSafeUploadDir(cwd, homeDir string, isHostAccess bool) bool {
 	}
 	rel, err := filepath.Rel(realHome, realCWD)
 	if err != nil {
-		return false
+		return "", false
 	}
-	return rel == "." || (!strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != "..")
+	if rel == "." || (!strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != "..") {
+		return rel, true
+	}
+	return "", false
 }
 
-// writeUploadedFileInDir writes filename inside targetDir using os.OpenRoot to prevent
-// symlink and TOCTOU directory traversal attacks.
-func writeUploadedFileInDir(targetDir, filename string, src io.Reader, user *auth.UserIdentity) (string, error) {
-	root, err := os.OpenRoot(targetDir)
+func isSafeUploadDir(cwd, homeDir string, isHostAccess bool) bool {
+	if _, ok := resolveRelativeToHome(cwd, homeDir); ok {
+		return true
+	}
+	if !isHostAccess {
+		return false
+	}
+	fi, err := os.Lstat(cwd)
+	if err != nil || fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+		return false
+	}
+	return true
+}
+
+// writeUploadedFileUnderRoot opens baseRootDir with os.OpenRoot and writes relSubDir/filename
+// through the root handle so every path component is kernel-checked with RESOLVE_BENEATH,
+// eliminating TOCTOU symlink swaps on subdirectories inside the user's home directory.
+func writeUploadedFileUnderRoot(baseRootDir, relSubDir, filename string, src io.Reader, user *auth.UserIdentity) (string, error) {
+	fi, err := os.Lstat(baseRootDir)
+	if err != nil || fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+		return "", os.ErrInvalid
+	}
+	root, err := os.OpenRoot(baseRootDir)
 	if err != nil {
 		return "", err
 	}
 	defer root.Close()
 
-	out, err := root.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|syscall.O_NOFOLLOW, 0644)
+	relTarget := filename
+	if relSubDir != "" && relSubDir != "." {
+		relTarget = filepath.Join(relSubDir, filename)
+	}
+
+	out, err := root.OpenFile(relTarget, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|syscall.O_NOFOLLOW, 0644)
 	if err != nil {
 		return "", err
 	}
-	defer out.Close()
+
+	if user != nil && os.Geteuid() == 0 && user.UID > 0 {
+		if err := out.Chown(int(user.UID), int(user.GID)); err != nil {
+			_ = out.Close()
+			_ = root.Remove(relTarget)
+			return "", err
+		}
+	}
 
 	if _, err := io.Copy(out, src); err != nil {
+		_ = out.Close()
+		_ = root.Remove(relTarget)
 		return "", err
 	}
-	if user != nil && os.Geteuid() == 0 && user.UID > 0 {
-		_ = out.Chown(int(user.UID), int(user.GID))
-	}
-	return filepath.Join(targetDir, filename), nil
+	_ = out.Close()
+	return filepath.Join(baseRootDir, relTarget), nil
+}
+
+// writeUploadedFileInDir writes filename inside targetDir using os.OpenRoot to prevent
+// symlink and TOCTOU directory traversal attacks.
+func writeUploadedFileInDir(targetDir, filename string, src io.Reader, user *auth.UserIdentity) (string, error) {
+	return writeUploadedFileUnderRoot(targetDir, ".", filename, src, user)
 }
 
 // handleAPIUserConfig handles GET /api/user/config and PUT /api/user/config.
@@ -368,7 +460,7 @@ func (server *Server) handleAPIUserConfig(w http.ResponseWriter, r *http.Request
 			http.Error(w, "Invalid JSON config payload: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-		if err := userconfig.Save(user.HomeDir, cfg); err != nil {
+		if err := userconfig.SaveAsUser(user.HomeDir, cfg, user.UID, user.GID); err != nil {
 			http.Error(w, "Failed to save user config: "+err.Error(), http.StatusInternalServerError)
 			return
 		}

@@ -30,12 +30,31 @@ function decodeBase64UTF8(b64: string): string {
     return new TextDecoder().decode(decodeBase64Bytes(b64));
 }
 
+const DANGEROUS_DOWNLOAD_EXTENSIONS = /\.(exe|msi|bat|cmd|ps1|sh|vbs|scr|app|command|desktop|html|htm|svg)$/i;
+
+export function sanitizeDownloadFilename(raw: string): string {
+    // Strip path traversal segments, control characters, and Unicode bidi overrides
+    const base = raw.replace(/\\/g, "/").split("/").pop() || "";
+    let cleaned = base.replace(/[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]/g, "").trim();
+    if (!cleaned || cleaned === "." || cleaned === "..") {
+        return "download";
+    }
+    if (cleaned.startsWith(".")) {
+        cleaned = "_" + cleaned.slice(1);
+    }
+    if (DANGEROUS_DOWNLOAD_EXTENSIONS.test(cleaned)) {
+        cleaned += ".download";
+    }
+    return cleaned;
+}
+
 export function triggerBrowserDownload(filename: string, data: Uint8Array): void {
+    const safeName = sanitizeDownloadFilename(filename);
     const blob = new Blob([data as unknown as BlobPart], { type: "application/octet-stream" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = filename;
+    a.download = safeName;
     a.style.display = "none";
     document.body.appendChild(a);
     a.click();
@@ -85,7 +104,7 @@ export class Osc7777Receiver {
             const now = Date.now();
             this.evictExpired(now);
 
-            const filename = decodeBase64UTF8(kv.filename);
+            const filename = sanitizeDownloadFilename(decodeBase64UTF8(kv.filename));
             const chunkBytes = decodeBase64Bytes(kv.data);
             const totalSize = kv.size ? parseInt(kv.size, 10) : chunkBytes.byteLength;
 

@@ -16,12 +16,12 @@
   let selectedHost = $state("localhost");
   let customHost = $state("");
   let useCustomHost = $state(false);
-  let targetPort = $state(8080);
+  let targetPort = $state(3000);
   let scheme = $state<"auto" | "http" | "https">("auto");
   let loading = $state(false);
   let errorMsg = $state("");
 
-  const COMMON_PORTS = [8080, 3000, 5173, 8000, 80, 443];
+  const COMMON_PORTS = [3000, 5173, 8000, 8080, 80, 443];
 
   let effectiveHost = $derived(
     useCustomHost ? customHost.trim() || "localhost" : selectedHost

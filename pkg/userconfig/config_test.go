@@ -1,6 +1,8 @@
 package userconfig
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -69,5 +71,32 @@ func TestSaveAndLoad(t *testing.T) {
 	}
 	if loaded.Keybindings.NewTabShortcut != "Ctrl+Shift+T" {
 		t.Errorf("got new_tab_shortcut %q, want Ctrl+Shift+T", loaded.Keybindings.NewTabShortcut)
+	}
+}
+
+func TestSaveAndLoad_RejectsSymlinkEscape(t *testing.T) {
+	tmp := t.TempDir()
+	home := filepath.Join(tmp, "home")
+	outside := filepath.Join(tmp, "outside_target.yaml")
+	_ = os.MkdirAll(filepath.Join(home, ".gotty"), 0755)
+	_ = os.WriteFile(outside, []byte("original_secret"), 0600)
+
+	// Symlink ~/.gotty/config.yaml -> outside_target.yaml
+	symlinkCfg := filepath.Join(home, ".gotty", "config.yaml")
+	if err := os.Symlink(outside, symlinkCfg); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Save(home, Default()); err == nil {
+		t.Fatalf("expected Save to reject symlinked config.yaml, but it succeeded")
+	}
+	if _, err := Load(home); err == nil {
+		t.Fatalf("expected Load to reject symlinked config.yaml, but it succeeded")
+	}
+
+	// Verify outside file was not overwritten
+	data, _ := os.ReadFile(outside)
+	if string(data) != "original_secret" {
+		t.Fatalf("outside target was modified via symlink: %q", string(data))
 	}
 }

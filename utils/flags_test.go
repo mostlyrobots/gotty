@@ -10,11 +10,11 @@ import (
 )
 
 type sampleOptions struct {
-	Host    string `hcl:"host" flagName:"host" flagSName:"H" flagDescribe:"Host address" default:"127.0.0.1"`
-	Port    int    `hcl:"port" flagName:"port" flagSName:"p" flagDescribe:"Port number" default:"8080"`
-	Enabled bool   `hcl:"enabled" flagName:"enabled" flagDescribe:"Enable feature" default:"true"`
-	Disabled bool  `hcl:"disabled" flagName:"disabled" flagDescribe:"Disable feature" default:"false"`
-	NoTag   string
+	Host     string `hcl:"host" flagName:"host" flagSName:"H" flagDescribe:"Host address" default:"127.0.0.1"`
+	Port     int    `hcl:"port" flagName:"port" flagSName:"p" flagDescribe:"Port number" default:"8080"`
+	Enabled  bool   `hcl:"enabled" flagName:"enabled" flagDescribe:"Enable feature" default:"true"`
+	Disabled bool   `hcl:"disabled" flagName:"disabled" flagDescribe:"Disable feature" default:"false"`
+	NoTag    string
 }
 
 func TestApplyDefaultValues_AndFlags_AndConfigFile(t *testing.T) {

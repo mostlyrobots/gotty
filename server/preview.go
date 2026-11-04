@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -11,9 +12,12 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/sorenisanerd/gotty/pkg/auth"
@@ -38,17 +42,17 @@ type PreviewTargetConfig struct {
 	PreviewURL      string `json:"preview_url"`
 }
 
-// PreviewManager manages the Web Preview reverse proxy and dynamic port 8080 forwarder.
+// PreviewManager manages the Web Preview reverse proxy with per-user target state
+// and container network-namespace isolation for sandboxed users.
 type PreviewManager struct {
-	mu        sync.RWMutex
-	current   PreviewTargetConfig
-	endpoints []PreviewEndpoint
-	listener  net.Listener
-	srv       *http.Server
-	transport *http.Transport
+	mu          sync.RWMutex
+	current     PreviewTargetConfig
+	userTargets map[string]PreviewTargetConfig
+	endpoints   []PreviewEndpoint
+	transport   *http.Transport
 }
 
-// NewPreviewManager creates a new PreviewManager initialized to forward to localhost:8080
+// NewPreviewManager creates a new PreviewManager initialized to forward to localhost:3000
 // and dynamically introspects local network interfaces at startup.
 func NewPreviewManager() *PreviewManager {
 	tr := &http.Transport{
@@ -64,37 +68,41 @@ func NewPreviewManager() *PreviewManager {
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 
+	defaultCfg := PreviewTargetConfig{
+		TargetHost:      "localhost",
+		TargetPort:      3000,
+		Scheme:          "auto",
+		ForwarderPort:   3000,
+		ForwarderActive: false,
+		PreviewURL:      "./preview/localhost:3000/",
+	}
+
 	pm := &PreviewManager{
-		current: PreviewTargetConfig{
-			TargetHost:    "localhost",
-			TargetPort:    8080,
-			Scheme:        "auto",
-			ForwarderPort: 8080,
-			PreviewURL:    "./preview/localhost:8080/",
-		},
-		endpoints: discoverPreviewEndpoints(),
-		transport: tr,
+		current:     defaultCfg,
+		userTargets: make(map[string]PreviewTargetConfig),
+		endpoints:   discoverPreviewEndpoints(),
+		transport:   tr,
 	}
 	return pm
 }
 
-// Close stops the dynamic port 8080 forwarder if running.
+// Close cleans up idle connections on the preview transport.
 func (pm *PreviewManager) Close() {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
-	if pm.srv != nil {
-		_ = pm.srv.Close()
-		pm.srv = nil
-	}
-	if pm.listener != nil {
-		_ = pm.listener.Close()
-		pm.listener = nil
+	if pm.transport != nil {
+		pm.transport.CloseIdleConnections()
 	}
 	pm.current.ForwarderActive = false
 }
 
-// SetTarget updates the active preview target and reconfigures the port 8080 local forwarder.
+// SetTarget updates the default preview target configuration.
 func (pm *PreviewManager) SetTarget(host string, port int, scheme string) (PreviewTargetConfig, error) {
+	return pm.SetTargetForUser("", host, port, scheme)
+}
+
+// SetTargetForUser updates the active preview target for a specific authenticated username.
+func (pm *PreviewManager) SetTargetForUser(username, host string, port int, scheme string) (PreviewTargetConfig, error) {
 	host = strings.TrimSpace(host)
 	if host == "" {
 		host = "localhost"
@@ -119,52 +127,37 @@ func (pm *PreviewManager) SetTarget(host string, port int, scheme string) (Previ
 		previewURL = fmt.Sprintf("./preview/https/%s/", hostPort)
 	}
 
-	pm.current.TargetHost = host
-	pm.current.TargetPort = port
-	pm.current.Scheme = scheme
-	pm.current.PreviewURL = previewURL
-
-	// If target is port 8080 on localhost/loopback, do not bind 8080 to avoid a self-loop
-	isLoopback8080 := port == 8080 && (host == "localhost" || host == "127.0.0.1" || host == "::1")
-	if isLoopback8080 {
-		if pm.srv != nil {
-			_ = pm.srv.Close()
-			pm.srv = nil
-			pm.listener = nil
-		}
-		pm.current.ForwarderActive = false
-		return pm.current, nil
+	cfg := PreviewTargetConfig{
+		TargetHost:      host,
+		TargetPort:      port,
+		Scheme:          scheme,
+		ForwarderPort:   port,
+		ForwarderActive: false,
+		PreviewURL:      previewURL,
 	}
 
-	// Ensure port 8080 dynamic forwarder is running if port 8080 is available
-	if pm.srv == nil {
-		ln, err := net.Listen("tcp", "127.0.0.1:8080")
-		if err == nil {
-			pm.listener = ln
-			pm.srv = &http.Server{
-				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					pm.mu.RLock()
-					cfg := pm.current
-					pm.mu.RUnlock()
-					pm.serveReverseProxy(w, r, cfg.TargetHost, cfg.TargetPort, cfg.Scheme, "")
-				}),
-			}
-			pm.current.ForwarderActive = true
-			go func(s *http.Server, l net.Listener) {
-				_ = s.Serve(l)
-			}(pm.srv, ln)
-		} else {
-			pm.current.ForwarderActive = false
-		}
+	pm.current = cfg
+	if username != "" {
+		pm.userTargets[username] = cfg
 	}
 
-	return pm.current, nil
+	return cfg, nil
 }
 
 // GetState returns the current target config and all introspected local endpoints.
 func (pm *PreviewManager) GetState() (PreviewTargetConfig, []PreviewEndpoint) {
+	return pm.GetStateForUser("")
+}
+
+// GetStateForUser returns the active target config for username and all introspected local endpoints.
+func (pm *PreviewManager) GetStateForUser(username string) (PreviewTargetConfig, []PreviewEndpoint) {
 	pm.mu.RLock()
 	cfg := pm.current
+	if username != "" {
+		if uCfg, ok := pm.userTargets[username]; ok {
+			cfg = uCfg
+		}
+	}
 	cached := pm.endpoints
 	pm.mu.RUnlock()
 
@@ -286,7 +279,7 @@ func isAllowedPreviewHost(host string) bool {
 }
 
 // resolvePreviewScheme determines whether the target endpoint speaks HTTPS or HTTP.
-func (pm *PreviewManager) resolvePreviewScheme(host string, port int, requestedScheme string) string {
+func (pm *PreviewManager) resolvePreviewScheme(host string, port int, requestedScheme string, containerPID int) string {
 	if requestedScheme == "http" || requestedScheme == "https" {
 		return requestedScheme
 	}
@@ -295,18 +288,111 @@ func (pm *PreviewManager) resolvePreviewScheme(host string, port int, requestedS
 	}
 	// Quick TLS probe if auto
 	targetAddr := net.JoinHostPort(host, strconv.Itoa(port))
-	dialer := &net.Dialer{Timeout: 300 * time.Millisecond}
-	conn, err := tls.DialWithDialer(dialer, "tcp", targetAddr, &tls.Config{InsecureSkipVerify: true})
-	if err == nil {
-		_ = conn.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	var rawConn net.Conn
+	var err error
+	if containerPID > 0 {
+		rawConn, err = dialInContainerNetNS(ctx, containerPID, "tcp", targetAddr)
+	} else {
+		dialer := &net.Dialer{Timeout: 300 * time.Millisecond}
+		rawConn, err = dialer.DialContext(ctx, "tcp", targetAddr)
+	}
+	if err != nil {
+		return "http"
+	}
+	tlsConn := tls.Client(rawConn, &tls.Config{InsecureSkipVerify: true})
+	_ = tlsConn.SetDeadline(time.Now().Add(300 * time.Millisecond))
+	if err := tlsConn.Handshake(); err == nil {
+		_ = tlsConn.Close()
 		return "https"
 	}
+	_ = rawConn.Close()
 	return "http"
 }
 
+func sysSetnsNum() uintptr {
+	switch runtime.GOARCH {
+	case "amd64":
+		return 308
+	case "arm64", "riscv64":
+		return 268
+	case "386":
+		return 346
+	case "arm":
+		return 375
+	default:
+		return 308
+	}
+}
+
+// dialInContainerNetNS opens a TCP socket to addr inside /proc/<containerPID>/ns/net
+// so sandboxed users preview services bound to 127.0.0.1 inside their container rather than the host.
+func dialInContainerNetNS(ctx context.Context, containerPID int, network, addr string) (net.Conn, error) {
+	if runtime.GOOS != "linux" || containerPID <= 0 {
+		return nil, fmt.Errorf("container network namespace unavailable (pid=%d)", containerPID)
+	}
+
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	ch := make(chan dialResult, 1)
+
+	go func() {
+		runtime.LockOSThread()
+		tid := syscall.Gettid()
+		origNSPath := fmt.Sprintf("/proc/self/task/%d/ns/net", tid)
+		origNS, err := os.Open(origNSPath)
+		if err != nil {
+			runtime.UnlockOSThread()
+			ch <- dialResult{nil, fmt.Errorf("failed to open host netns: %w", err)}
+			return
+		}
+		defer origNS.Close()
+
+		targetNSPath := fmt.Sprintf("/proc/%d/ns/net", containerPID)
+		targetNS, err := os.Open(targetNSPath)
+		if err != nil {
+			runtime.UnlockOSThread()
+			ch <- dialResult{nil, fmt.Errorf("failed to open container netns %s: %w", targetNSPath, err)}
+			return
+		}
+		defer targetNS.Close()
+
+		const cloneNewNet = 0x40000000 // syscall.CLONE_NEWNET
+		if _, _, errno := syscall.Syscall(sysSetnsNum(), targetNS.Fd(), cloneNewNet, 0); errno != 0 {
+			runtime.UnlockOSThread()
+			ch <- dialResult{nil, fmt.Errorf("setns to container %d failed: %v", containerPID, errno)}
+			return
+		}
+
+		dialer := &net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}
+		conn, dialErr := dialer.DialContext(ctx, network, addr)
+
+		// Restore host netns before unlocking OS thread; if restore fails, do NOT unlock so the thread terminates.
+		if _, _, errno := syscall.Syscall(sysSetnsNum(), origNS.Fd(), cloneNewNet, 0); errno != 0 {
+			if conn != nil {
+				_ = conn.Close()
+			}
+			ch <- dialResult{nil, fmt.Errorf("failed to restore host netns: %v", errno)}
+			return
+		}
+		runtime.UnlockOSThread()
+		ch <- dialResult{conn, dialErr}
+	}()
+
+	res := <-ch
+	return res.conn, res.err
+}
+
 // serveReverseProxy proxies HTTP, HTTPS, and WebSocket requests to host:port.
-func (pm *PreviewManager) serveReverseProxy(w http.ResponseWriter, r *http.Request, host string, port int, scheme string, stripPrefix string) {
-	resolvedScheme := pm.resolvePreviewScheme(host, port, scheme)
+// When containerPID > 0, connections are dialed inside the container's network namespace.
+func (pm *PreviewManager) serveReverseProxy(w http.ResponseWriter, r *http.Request, host string, port int, scheme string, stripPrefix string, containerPID int) {
+	resolvedScheme := pm.resolvePreviewScheme(host, port, scheme, containerPID)
 	targetAddr := net.JoinHostPort(host, strconv.Itoa(port))
 
 	targetURL := &url.URL{
@@ -314,8 +400,23 @@ func (pm *PreviewManager) serveReverseProxy(w http.ResponseWriter, r *http.Reque
 		Host:   targetAddr,
 	}
 
+	transport := pm.transport
+	if containerPID > 0 {
+		transport = &http.Transport{
+			Proxy: nil,
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return dialInContainerNetNS(ctx, containerPID, network, addr)
+			},
+			TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+			MaxIdleConns:          16,
+			IdleConnTimeout:       30 * time.Second,
+			TLSHandshakeTimeout:   5 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
+	}
+
 	proxy := &httputil.ReverseProxy{
-		Transport: pm.transport,
+		Transport: transport,
 		Director: func(req *http.Request) {
 			req.URL.Scheme = targetURL.Scheme
 			req.URL.Host = targetURL.Host
@@ -340,8 +441,9 @@ func (pm *PreviewManager) serveReverseProxy(w http.ResponseWriter, r *http.Reque
 			}
 		},
 		ModifyResponse: func(resp *http.Response) error {
-			// Allow embedding or cross-tab previewing cleanly
-			resp.Header.Del("X-Frame-Options")
+			// Ensure browser sends Referer on sub-requests so GoTTY can route preview assets
+			// and block preview scripts from invoking GoTTY control plane endpoints.
+			resp.Header.Set("Referrer-Policy", "same-origin")
 			// Rewrite root-relative redirect Location headers to stay inside /preview/...
 			if loc := resp.Header.Get("Location"); loc != "" && stripPrefix != "" {
 				if strings.HasPrefix(loc, "/") && !strings.HasPrefix(loc, "//") && !strings.HasPrefix(loc, stripPrefix) {
@@ -427,9 +529,14 @@ func (server *Server) handleAPIPreview(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 
+	var username string
+	if user != nil {
+		username = user.Username
+	}
+
 	switch r.Method {
 	case http.MethodGet:
-		cfg, endpoints := server.previewManager.GetState()
+		cfg, endpoints := server.previewManager.GetStateForUser(username)
 		if user != nil && !user.IsHostAccess {
 			var filtered []PreviewEndpoint
 			for _, ep := range endpoints {
@@ -455,7 +562,7 @@ func (server *Server) handleAPIPreview(w http.ResponseWriter, r *http.Request) {
 			_ = json.Unmarshal(bodyBytes, &req)
 		}
 		if req.TargetPort == 0 {
-			req.TargetPort = 8080
+			req.TargetPort = 3000
 		}
 		targetHost := strings.TrimSpace(req.TargetHost)
 		if targetHost == "" {
@@ -465,7 +572,7 @@ func (server *Server) handleAPIPreview(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "403 Forbidden: target host is not permitted for your privilege level", http.StatusForbidden)
 			return
 		}
-		cfg, err := server.previewManager.SetTarget(targetHost, req.TargetPort, req.Scheme)
+		cfg, err := server.previewManager.SetTargetForUser(username, targetHost, req.TargetPort, req.Scheme)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -480,6 +587,31 @@ func (server *Server) handleAPIPreview(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// resolvePreviewContainerPID returns the container PID to dial inside when previewing a target.
+// For sandboxed users (!user.IsHostAccess), host loopback is never exposed when container runtime
+// or a container session is present.
+func (server *Server) resolvePreviewContainerPID(user *auth.UserIdentity, host string) (int, error) {
+	if user == nil || server.sessionManager == nil {
+		return 0, nil
+	}
+	pid, hasContainer := server.sessionManager.ResolveSandboxContainerPID(user.Username)
+	if !user.IsHostAccess {
+		if pid > 0 {
+			return pid, nil
+		}
+		if hasContainer || server.options.ContainerRuntime != "" {
+			return 0, fmt.Errorf("no active sandbox container found for user %s", user.Username)
+		}
+		return 0, nil
+	}
+	// Host-authorized user: if previewing localhost and they have an active sandbox container,
+	// prefer host loopback if listening, otherwise fall back to their sandbox container's netns.
+	if pid > 0 && isLoopbackHost(host) {
+		return 0, nil
+	}
+	return 0, nil
+}
+
 // handlePreviewProxy handles requests to /preview/<host>:<port>/... or /preview/<scheme>/<host>:<port>/...
 func (server *Server) handlePreviewProxy(w http.ResponseWriter, r *http.Request, basePrefix string) {
 	var user *auth.UserIdentity
@@ -488,6 +620,11 @@ func (server *Server) handlePreviewProxy(w http.ResponseWriter, r *http.Request,
 		if user == nil {
 			return
 		}
+	}
+
+	var username string
+	if user != nil {
+		username = user.Username
 	}
 
 	// Parse URL structure: /preview/[http|https/]<host>[:<port>]/...
@@ -518,13 +655,13 @@ func (server *Server) handlePreviewProxy(w http.ResponseWriter, r *http.Request,
 			}
 			port = p
 		} else {
-			// If only a port number was given (e.g. /preview/8080/), assume localhost
+			// If only a port number was given (e.g. /preview/3000/), assume localhost
 			if p, err := strconv.Atoi(hostPortToken); err == nil && p >= 1 && p <= 65535 {
 				host = "localhost"
 				port = p
 			} else if isAllowedPreviewHost(hostPortToken) {
 				host = hostPortToken
-				port = 8080
+				port = 3000
 			}
 		}
 		if host != "" {
@@ -535,7 +672,7 @@ func (server *Server) handlePreviewProxy(w http.ResponseWriter, r *http.Request,
 
 	// If no explicit host:port in URL (e.g. /preview/), use current active target from PreviewManager
 	if host == "" {
-		cfg, _ := server.previewManager.GetState()
+		cfg, _ := server.previewManager.GetStateForUser(username)
 		host = cfg.TargetHost
 		port = cfg.TargetPort
 		scheme = cfg.Scheme
@@ -547,7 +684,13 @@ func (server *Server) handlePreviewProxy(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	// Redirect /preview/localhost:8080 -> /preview/localhost:8080/ so relative links resolve properly
+	containerPID, err := server.resolvePreviewContainerPID(user, host)
+	if err != nil {
+		http.Error(w, "502 Bad Gateway: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	// Redirect /preview/localhost:3000 -> /preview/localhost:3000/ so relative links resolve properly
 	if r.URL.Path == stripPrefix {
 		targetPath := stripPrefix + "/"
 		if r.URL.RawQuery != "" {
@@ -567,13 +710,14 @@ func (server *Server) handlePreviewProxy(w http.ResponseWriter, r *http.Request,
 		SameSite: http.SameSiteLaxMode,
 	})
 
-	log.Printf("preview: %s %s -> %s (%s:%d)", r.Method, r.URL.Path, scheme, host, port)
-	server.previewManager.serveReverseProxy(w, r, host, port, scheme, stripPrefix)
+	log.Printf("preview: %s %s -> %s (%s:%d, netns_pid=%d)", r.Method, r.URL.Path, scheme, host, port, containerPID)
+	server.previewManager.serveReverseProxy(w, r, host, port, scheme, stripPrefix, containerPID)
 }
 
 // tryPreviewFallback checks if an unmatched non-root request came from an active Preview tab
-// (via Referer header or gotty_preview_target cookie) and proxies it to the target.
-func (server *Server) tryPreviewFallback(w http.ResponseWriter, r *http.Request, pathPrefix string) bool {
+// (via Referer header or gotty_preview_target cookie) and proxies it to the target while enforcing
+// the user's privilege and network-namespace boundaries.
+func (server *Server) tryPreviewFallback(w http.ResponseWriter, r *http.Request, pathPrefix string, user *auth.UserIdentity) bool {
 	if r.URL.Path == pathPrefix || r.URL.Path == "/" {
 		return false
 	}
@@ -593,8 +737,17 @@ func (server *Server) tryPreviewFallback(w http.ResponseWriter, r *http.Request,
 			}
 			if len(parts) > idx && parts[idx] != "" {
 				if h, pStr, err := net.SplitHostPort(parts[idx]); err == nil {
-					if p, err := strconv.Atoi(pStr); err == nil && isAllowedPreviewHost(h) {
-						server.previewManager.serveReverseProxy(w, r, h, p, scheme, "")
+					if p, err := strconv.Atoi(pStr); err == nil && p >= 1 && p <= 65535 {
+						if !isAllowedPreviewHostForUser(h, user) {
+							http.Error(w, "403 Forbidden: preview host is not permitted for your privilege level", http.StatusForbidden)
+							return true
+						}
+						containerPID, err := server.resolvePreviewContainerPID(user, h)
+						if err != nil {
+							http.Error(w, "502 Bad Gateway: "+err.Error(), http.StatusBadGateway)
+							return true
+						}
+						server.previewManager.serveReverseProxy(w, r, h, p, scheme, "", containerPID)
 						return true
 					}
 				}
@@ -608,8 +761,17 @@ func (server *Server) tryPreviewFallback(w http.ResponseWriter, r *http.Request,
 		if len(fields) == 3 {
 			scheme := fields[0]
 			host := fields[1]
-			if port, err := strconv.Atoi(fields[2]); err == nil && isAllowedPreviewHost(host) {
-				server.previewManager.serveReverseProxy(w, r, host, port, scheme, "")
+			if port, err := strconv.Atoi(fields[2]); err == nil && port >= 1 && port <= 65535 {
+				if !isAllowedPreviewHostForUser(host, user) {
+					http.Error(w, "403 Forbidden: preview host is not permitted for your privilege level", http.StatusForbidden)
+					return true
+				}
+				containerPID, err := server.resolvePreviewContainerPID(user, host)
+				if err != nil {
+					http.Error(w, "502 Bad Gateway: "+err.Error(), http.StatusBadGateway)
+					return true
+				}
+				server.previewManager.serveReverseProxy(w, r, host, port, scheme, "", containerPID)
 				return true
 			}
 		}

@@ -86,6 +86,9 @@ func (r *Resolver) Resolve(headerVal string) (*UserIdentity, error) {
 			if err != nil {
 				continue
 			}
+			if uid == 0 || name == "root" {
+				return nil, fmt.Errorf("auth: direct root (UID 0) login via proxy header is forbidden; authenticate as a non-root user in %v", DefaultHostGroups)
+			}
 			matched = &UserIdentity{
 				Username: name,
 				UID:      uint32(uid),

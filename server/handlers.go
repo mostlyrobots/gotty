@@ -15,6 +15,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/pkg/errors"
 
+	"github.com/sorenisanerd/gotty/pkg/auth"
 	"github.com/sorenisanerd/gotty/webtty"
 )
 
@@ -68,6 +69,12 @@ func (server *Server) generateHandleWS(ctx context.Context, cancel context.Cance
 			return
 		}
 
+		if isFromPreviewReferer(r) {
+			closeReason = "preview referer blocked"
+			http.Error(w, "403 Forbidden: websocket access from preview context is blocked", http.StatusForbidden)
+			return
+		}
+
 		var username string
 		if server.options.EnableProxyAuth || server.options.DefaultUser != "" {
 			user := server.authenticateRequest(w, r)
@@ -110,6 +117,7 @@ func (server *Server) generateHandleWS(ctx context.Context, cancel context.Cance
 }
 
 func (server *Server) processWSConn(ctx context.Context, conn *websocket.Conn, headers map[string][]string, sessionID string, username string) error {
+	conn.SetReadLimit(64 * 1024)
 	typ, initLine, err := conn.ReadMessage()
 	if err != nil {
 		return errors.Wrapf(err, "failed to authenticate websocket connection")
@@ -234,15 +242,22 @@ func (server *Server) processWSConn(ctx context.Context, conn *websocket.Conn, h
 }
 
 func (server *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	var user *auth.UserIdentity
 	if server.options.EnableProxyAuth || server.options.DefaultUser != "" {
-		if server.authenticateRequest(w, r) == nil {
+		user = server.authenticateRequest(w, r)
+		if user == nil {
 			return
 		}
 	}
 
-	if server.previewManager != nil && server.tryPreviewFallback(w, r, "/") {
+	if server.previewManager != nil && server.tryPreviewFallback(w, r, "/", user) {
 		return
 	}
+
+	// Isolate the main GoTTY terminal page from cross-window opener scripting and framing
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
+	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com; img-src 'self' data: blob: https: http:; connect-src 'self' ws: wss:; frame-ancestors 'none'")
 
 	indexVars, err := server.indexVariables(r)
 	if err != nil {
@@ -295,13 +310,22 @@ func (server *Server) indexVariables(r *http.Request) (map[string]interface{}, e
 	}
 
 	indexVars := map[string]interface{}{
-		"title": titleBuf.String(),
+		"title":   titleBuf.String(),
 		"favicon": server.options.Favicon,
 	}
 	return indexVars, err
 }
 
 func (server *Server) handleAuthToken(w http.ResponseWriter, r *http.Request) {
+	if isFromPreviewReferer(r) {
+		http.Error(w, "403 Forbidden", http.StatusForbidden)
+		return
+	}
+	if server.options.EnableProxyAuth || server.options.DefaultUser != "" {
+		if server.authenticateRequest(w, r) == nil {
+			return
+		}
+	}
 	w.Header().Set("Content-Type", "application/javascript")
 	tokenJSON, _ := json.Marshal(server.options.Credential)
 	w.Write([]byte("var gotty_auth_token = " + string(tokenJSON) + ";"))

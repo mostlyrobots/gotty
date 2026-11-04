@@ -22,6 +22,13 @@ type CWDResolver interface {
 	ResolveCWD() (string, error)
 }
 
+// ContainerPIDResolver is an optional interface implemented by Slave backends that run
+// inside an isolated container network namespace and can report the container's init PID on the host.
+type ContainerPIDResolver interface {
+	IsSandboxedContainer() bool
+	ResolveContainerPID() (int, error)
+}
+
 // ContainerOptions configures the container runtime backend.
 type ContainerOptions struct {
 	Runtime      string // "docker" or "podman" (auto-detected if empty)
@@ -57,6 +64,15 @@ func BuildContainerArgs(user *auth.UserIdentity, containerName string, image str
 	args := []string{
 		"run", "-it", "--rm",
 		"--name", containerName,
+		"--pids-limit=512",
+		"--cap-drop=MKNOD",
+		"--cap-drop=SYS_ADMIN",
+		"--cap-drop=SYS_MODULE",
+		"--cap-drop=SYS_PTRACE",
+		"--cap-drop=SYS_RAWIO",
+		"--cap-drop=NET_ADMIN",
+		"--cap-drop=MAC_ADMIN",
+		"--cap-drop=MAC_OVERRIDE",
 		"-e", "TERM=xterm-256color",
 		"-e", "GOTTY_USER=" + user.Username,
 		"--security-opt", "label=disable",
@@ -167,7 +183,13 @@ func NewContainerSlave(user *auth.UserIdentity, sessionID string, opts Container
 		if user.HomeDir != "" && fileExists(user.HomeDir) {
 			cmd.Dir = user.HomeDir
 		}
-		cmd.Env = append(os.Environ(),
+		var cleanEnv []string
+		for _, kv := range []string{"LANG", "LC_ALL", "TZ", "COLORTERM"} {
+			if val := os.Getenv(kv); val != "" {
+				cleanEnv = append(cleanEnv, kv+"="+val)
+			}
+		}
+		cmd.Env = append(cleanEnv,
 			"TERM=xterm-256color",
 			"GOTTY_USER="+user.Username,
 			"GOTTY_SESSION_ID="+sessionID,
@@ -175,7 +197,7 @@ func NewContainerSlave(user *auth.UserIdentity, sessionID string, opts Container
 			"USER="+user.Username,
 			"LOGNAME="+user.Username,
 			"SHELL="+shell,
-			"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin",
+			"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 		)
 		if user.HomeDir != "" {
 			cmd.Env = append(cmd.Env, "HOME="+user.HomeDir)
@@ -273,17 +295,33 @@ func (cs *ContainerSlave) ResizeTerminal(width int, height int) error {
 	return pty.Setsize(cs.ptyFile, &window)
 }
 
+// IsSandboxedContainer returns true if this slave is running inside a container rather than directly on the host.
+func (cs *ContainerSlave) IsSandboxedContainer() bool {
+	return !cs.isDirectHost && cs.runtime != "" && cs.containerName != ""
+}
+
+// ResolveContainerPID returns the host PID of the container's init process via docker/podman inspect.
+func (cs *ContainerSlave) ResolveContainerPID() (int, error) {
+	if !cs.IsSandboxedContainer() {
+		return 0, errors.New("session is not running in a container")
+	}
+	out, err := exec.Command(cs.runtime, "inspect", "--format", "{{.State.Pid}}", cs.containerName).Output()
+	if err != nil {
+		return 0, errors.Wrap(err, "failed to inspect container PID")
+	}
+	pidStr := strings.TrimSpace(string(out))
+	pid, err := strconv.Atoi(pidStr)
+	if err != nil || pid <= 0 {
+		return 0, errors.New("invalid container PID")
+	}
+	return pid, nil
+}
+
 // ResolveCWD resolves the active working directory of the session process via /proc/<pid>/cwd.
 func (cs *ContainerSlave) ResolveCWD() (string, error) {
-	if !cs.isDirectHost && cs.runtime != "" && cs.containerName != "" {
-		out, err := exec.Command(cs.runtime, "inspect", "--format", "{{.State.Pid}}", cs.containerName).Output()
-		if err == nil {
-			pidStr := strings.TrimSpace(string(out))
-			if pid, err := strconv.Atoi(pidStr); err == nil && pid > 0 {
-				if cwd, err := resolveProcCWD(pid); err == nil {
-					return cwd, nil
-				}
-			}
+	if pid, err := cs.ResolveContainerPID(); err == nil && pid > 0 {
+		if cwd, err := resolveProcCWD(pid); err == nil {
+			return cwd, nil
 		}
 	}
 	if cs.cmd != nil && cs.cmd.Process != nil && cs.cmd.Process.Pid > 0 {

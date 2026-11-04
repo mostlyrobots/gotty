@@ -115,12 +115,7 @@ func (lcmd *LocalCommand) ResolveCWD() (string, error) {
 	if lcmd.cmd == nil || lcmd.cmd.Process == nil || lcmd.cmd.Process.Pid <= 0 {
 		return "", errors.New("process not running")
 	}
-	cwd, err := os.Readlink("/proc/" + strings.TrimSpace(string(rune(lcmd.cmd.Process.Pid))) + "/cwd")
-	if err != nil {
-		// Use fmt-free strconv fallback
-		return os.Readlink(procCwdPath(lcmd.cmd.Process.Pid))
-	}
-	return cwd, nil
+	return os.Readlink(procCwdPath(lcmd.cmd.Process.Pid))
 }
 
 func procCwdPath(pid int) string {

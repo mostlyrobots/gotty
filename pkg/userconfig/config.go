@@ -3,10 +3,12 @@ package userconfig
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -88,43 +90,107 @@ func ConfigPath(homeDir string) string {
 	return filepath.Join(homeDir, ".gotty", "config.yaml")
 }
 
-// Load reads ~/.gotty/config.yaml from homeDir. If the file does not exist,
-// Default() is returned without error.
+// Load reads ~/.gotty/config.yaml from homeDir using os.OpenRoot to prevent symlink escapes.
+// If the file does not exist, Default() is returned without error.
 func Load(homeDir string) (*Config, error) {
 	cfg := Default()
 	if homeDir == "" {
 		return cfg, nil
 	}
-	path := ConfigPath(homeDir)
-	data, err := os.ReadFile(path)
+	fi, err := os.Lstat(homeDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return cfg, nil
 		}
-		return nil, fmt.Errorf("userconfig: failed to read %s: %w", path, err)
+		return nil, fmt.Errorf("userconfig: failed to lstat homeDir %s: %w", homeDir, err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+		return nil, fmt.Errorf("userconfig: homeDir %s must be a real directory, not a symlink", homeDir)
+	}
+
+	root, err := os.OpenRoot(homeDir)
+	if err != nil {
+		return nil, fmt.Errorf("userconfig: failed to open root %s: %w", homeDir, err)
+	}
+	defer root.Close()
+
+	f, err := root.OpenFile(filepath.Join(".gotty", "config.yaml"), os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return cfg, nil
+		}
+		return nil, fmt.Errorf("userconfig: failed to open config.yaml in %s: %w", homeDir, err)
+	}
+	defer f.Close()
+
+	data, err := io.ReadAll(io.LimitReader(f, 64*1024))
+	if err != nil {
+		return nil, fmt.Errorf("userconfig: failed to read config.yaml in %s: %w", homeDir, err)
 	}
 	if err := ParseYAML(string(data), cfg); err != nil {
-		return nil, fmt.Errorf("userconfig: failed to parse %s: %w", path, err)
+		return nil, fmt.Errorf("userconfig: failed to parse config.yaml in %s: %w", homeDir, err)
 	}
 	return cfg, nil
 }
 
 // Save writes the Config as YAML to ~/.gotty/config.yaml inside homeDir.
 func Save(homeDir string, cfg *Config) error {
+	return SaveAsUser(homeDir, cfg, 0, 0)
+}
+
+// SaveAsUser writes the Config as YAML to ~/.gotty/config.yaml inside homeDir
+// using os.OpenRoot and O_NOFOLLOW to prevent symlink privilege escalation,
+// and sets ownership to uid:gid before writing when running as root.
+func SaveAsUser(homeDir string, cfg *Config, uid, gid uint32) error {
 	if homeDir == "" {
 		return fmt.Errorf("userconfig: empty home directory")
 	}
 	if cfg.Version == "" {
 		cfg.Version = "1.0"
 	}
-	dir := filepath.Join(homeDir, ".gotty")
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("userconfig: failed to create %s: %w", dir, err)
+	fi, err := os.Lstat(homeDir)
+	if err != nil {
+		return fmt.Errorf("userconfig: failed to lstat homeDir %s: %w", homeDir, err)
 	}
-	path := ConfigPath(homeDir)
+	if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+		return fmt.Errorf("userconfig: homeDir %s must be a real directory, not a symlink", homeDir)
+	}
+
+	root, err := os.OpenRoot(homeDir)
+	if err != nil {
+		return fmt.Errorf("userconfig: failed to open root %s: %w", homeDir, err)
+	}
+	defer root.Close()
+
+	if err := root.Mkdir(".gotty", 0755); err != nil && !os.IsExist(err) {
+		return fmt.Errorf("userconfig: failed to create .gotty in %s: %w", homeDir, err)
+	}
+
+	dirFile, err := root.OpenFile(".gotty", syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		return fmt.Errorf("userconfig: .gotty in %s is not a safe directory: %w", homeDir, err)
+	}
+	if os.Geteuid() == 0 && uid > 0 {
+		_ = dirFile.Chown(int(uid), int(gid))
+	}
+	_ = dirFile.Close()
+
+	relPath := filepath.Join(".gotty", "config.yaml")
+	out, err := root.OpenFile(relPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|syscall.O_NOFOLLOW, 0644)
+	if err != nil {
+		return fmt.Errorf("userconfig: failed to open %s in %s safely: %w", relPath, homeDir, err)
+	}
+	defer out.Close()
+
+	if os.Geteuid() == 0 && uid > 0 {
+		if err := out.Chown(int(uid), int(gid)); err != nil {
+			return fmt.Errorf("userconfig: failed to chown %s: %w", relPath, err)
+		}
+	}
+
 	content := MarshalYAML(cfg)
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-		return fmt.Errorf("userconfig: failed to write %s: %w", path, err)
+	if _, err := out.WriteString(content); err != nil {
+		return fmt.Errorf("userconfig: failed to write %s in %s: %w", relPath, homeDir, err)
 	}
 	return nil
 }

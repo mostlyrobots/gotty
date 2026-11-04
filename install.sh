@@ -79,7 +79,7 @@ fi
 
 if [ -n "$CONTAINER_RUNTIME" ] && [ -f "$PROJECT_ROOT/Containerfile" ]; then
     echo "==> Building gotty-sandbox:latest container image..."
-    $SUDO_CMD $CONTAINER_RUNTIME build -t gotty-sandbox:latest -f "$PROJECT_ROOT/Containerfile" "$PROJECT_ROOT" || true
+    $SUDO_CMD $CONTAINER_RUNTIME build -t gotty-sandbox:latest -f "$PROJECT_ROOT/Containerfile" "$PROJECT_ROOT"
 fi
 
 # 6. Configure systemd service

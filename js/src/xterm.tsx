@@ -120,7 +120,7 @@ export class GoTTYXterm {
     }
 
     showMessage(message: string, timeout: number) {
-        this.message.innerHTML = message;
+        this.message.textContent = message;
         this.showMessageElem(timeout);
     }
 
@@ -267,7 +267,7 @@ export class GoTTYXterm {
         this.term.parser.registerOscHandler(52, (data: string) => {
             const semi = data.indexOf(";");
             const b64 = semi >= 0 ? data.slice(semi + 1) : data;
-            if (b64.length === 0) return true;
+            if (b64.length === 0 || b64.length > 2 * 1024 * 1024) return true;
             if (b64.charAt(b64.length - 1) === "?") return true;
             try {
                 const bin = atob(b64);

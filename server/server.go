@@ -279,6 +279,9 @@ func (server *Server) Run(ctx context.Context, options ...RunOption) error {
 	if server.previewManager != nil {
 		server.previewManager.Close()
 	}
+	if server.sessionManager != nil {
+		server.sessionManager.CloseAll()
+	}
 
 	return err
 }
@@ -347,7 +350,9 @@ func (server *Server) setupHandlers(ctx context.Context, cancel context.CancelFu
 
 func (server *Server) setupHTTPServer(handler http.Handler) (*http.Server, error) {
 	srv := &http.Server{
-		Handler: handler,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	if server.options.EnableTLSClientAuth {

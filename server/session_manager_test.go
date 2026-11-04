@@ -31,11 +31,11 @@ func newPipeSlave(cwd string) *pipeSlave {
 	return &pipeSlave{pr: pr, pw: pw, cwd: cwd}
 }
 
-func (p *pipeSlave) Read(b []byte) (int, error)         { return p.pr.Read(b) }
-func (p *pipeSlave) Write(b []byte) (int, error)        { return p.inBuf.Write(b) }
-func (p *pipeSlave) Close() error                       { p.closed = true; _ = p.pw.Close(); return p.pr.Close() }
+func (p *pipeSlave) Read(b []byte) (int, error)                   { return p.pr.Read(b) }
+func (p *pipeSlave) Write(b []byte) (int, error)                  { return p.inBuf.Write(b) }
+func (p *pipeSlave) Close() error                                 { p.closed = true; _ = p.pw.Close(); return p.pr.Close() }
 func (p *pipeSlave) WindowTitleVariables() map[string]interface{} { return nil }
-func (p *pipeSlave) ResizeTerminal(w, h int) error      { return nil }
+func (p *pipeSlave) ResizeTerminal(w, h int) error                { return nil }
 func (p *pipeSlave) ResolveCWD() (string, error) {
 	if p.cwd == "" {
 		return "", io.EOF
@@ -146,7 +146,14 @@ func TestBuildContainerArgs_Sandboxed(t *testing.T) {
 		IsHostAccess: false,
 	}
 	guestArgs := strings.Join(BuildContainerArgs(guest, "gotty-guest-1", "gotty-sandbox:latest", ""), " ")
-	for _, flag := range []string{"--security-opt label=disable", "-v /home/guest:/home/guest"} {
+	for _, flag := range []string{
+		"--security-opt label=disable",
+		"--pids-limit=512",
+		"--cap-drop=MKNOD",
+		"--cap-drop=SYS_ADMIN",
+		"--cap-drop=NET_ADMIN",
+		"-v /home/guest:/home/guest",
+	} {
 		if !strings.Contains(guestArgs, flag) {
 			t.Errorf("sandboxed container args missing %q: %s", flag, guestArgs)
 		}
@@ -312,7 +319,7 @@ func TestRESTAPI_AuthSessionsUploadAndConfig(t *testing.T) {
 		_, _ = w.Write([]byte("preview-ok:" + r.URL.Path))
 	}))
 	defer upstream.Close()
-	_, upstreamPortStr, _ := strings.Cut( strings.TrimPrefix(upstream.URL, "http://"), ":")
+	_, upstreamPortStr, _ := strings.Cut(strings.TrimPrefix(upstream.URL, "http://"), ":")
 
 	req, _ = http.NewRequest(http.MethodGet, ts.URL+"/api/preview", nil)
 	req.Header.Set("X-Forwarded-User", "devuser@example.com")
@@ -459,5 +466,72 @@ func TestSecurity_ProxyAuthDisabledAndSandboxPreviewScope(t *testing.T) {
 	if len(eps) == 0 || eps[0].Host != "localhost" {
 		t.Fatalf("expected localhost as first introspected endpoint, got %+v", eps)
 	}
+
+	// Sandboxed user attempting to bypass LAN IP restriction via tryPreviewFallback cookie or Referer must get 403
+	req, _ = http.NewRequest(http.MethodGet, proxyTS.URL+"/subresource.js", nil)
+	req.Header.Set("X-Custom-Auth-User", "guest@example.com")
+	req.AddCookie(&http.Cookie{Name: previewTargetCookie, Value: "http|192.168.1.1|80"})
+	resp, _ = http.DefaultClient.Do(req)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for sandboxed user cookie fallback to LAN IP, got %d", resp.StatusCode)
+	}
+
+	// Previewed web app attempting to access GoTTY control plane (/api/sessions) via Referer must be blocked
+	req, _ = http.NewRequest(http.MethodGet, proxyTS.URL+"/api/sessions", nil)
+	req.Header.Set("X-Custom-Auth-User", "devuser@example.com")
+	req.Header.Set("Referer", proxyTS.URL+"/preview/localhost:3000/index.html")
+	resp, _ = http.DefaultClient.Do(req)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden when accessing /api/sessions from /preview/ Referer, got %d", resp.StatusCode)
+	}
 }
 
+func TestOSCRingStripper_AndConflictingHeaders(t *testing.T) {
+	var stripper oscRingStripper
+	// Feed an OSC 7777 sequence split across multiple chunks surrounded by normal text
+	c1 := stripper.Filter([]byte("before\n\x1b]77"))
+	c2 := stripper.Filter([]byte("77;download;filename=dGVzdA==;data=AAAA"))
+	c3 := stripper.Filter([]byte("BBBB\x07after\n\x1b]52;c;aGVsbG8=\x07end"))
+	combined := string(c1) + string(c2) + string(c3)
+	if combined != "before\nafter\nend" {
+		t.Fatalf("unexpected OSC stripped output %q, want %q", combined, "before\nafter\nend")
+	}
+
+	// Verify conflicting identity headers are rejected when ProxyAuthHeader is unset
+	tmp := t.TempDir()
+	passwdFile := filepath.Join(tmp, "passwd")
+	groupFile := filepath.Join(tmp, "group")
+	_ = os.WriteFile(passwdFile, []byte("devuser:x:1000:1000:Dev:/home/devuser:/bin/bash\nguest:x:1002:1002:Guest:/home/guest:/bin/bash\n"), 0644)
+	_ = os.WriteFile(groupFile, []byte("wheel:x:10:devuser\n"), 0644)
+
+	srv, err := New(&mockFactory{}, &Options{
+		Address:         "127.0.0.1",
+		Port:            "0",
+		Path:            "/",
+		Quiet:           true,
+		EnableProxyAuth: true,
+		PasswdFile:      passwdFile,
+		GroupFile:       groupFile,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ts := httptest.NewServer(srv.setupHandlers(ctx, cancel, "/", newCounter(0)))
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/sessions", nil)
+	req.Header.Set("X-Forwarded-User", "devuser")
+	req.Header.Set("Remote-User", "guest")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for conflicting identity headers, got %d", resp.StatusCode)
+	}
+}

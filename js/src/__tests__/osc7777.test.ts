@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { Osc7777Receiver, type DownloadEvent } from "../osc7777";
+import { Osc7777Receiver, sanitizeDownloadFilename, type DownloadEvent } from "../osc7777";
 
 function toB64(s: string): string {
     return btoa(s);
@@ -73,5 +73,12 @@ describe("Osc7777Receiver (godl protocol)", () => {
         // Completing flood-11 (still in queue) succeeds
         receiver.handle(`download;id=flood-11;chunk=1;total=2;filename=${filename};size=10;data=${data}`);
         expect(cb).toHaveBeenCalledTimes(1);
+    });
+
+    it("sanitizes dangerous and traversal filenames in OSC 7777 downloads", () => {
+        expect(sanitizeDownloadFilename("../../.bashrc")).toBe("_bashrc");
+        expect(sanitizeDownloadFilename("C:\\Users\\admin\\payload.exe")).toBe("payload.exe.download");
+        expect(sanitizeDownloadFilename("evil.sh")).toBe("evil.sh.download");
+        expect(sanitizeDownloadFilename("report.tar.gz")).toBe("report.tar.gz");
     });
 });

@@ -103,4 +103,11 @@ guest:x:1002:
 			t.Fatalf("expected error for empty header, got nil")
 		}
 	})
+
+	t.Run("direct root login via proxy header is rejected", func(t *testing.T) {
+		_, err := resolver.Resolve("root")
+		if err == nil {
+			t.Fatalf("expected error when resolving root directly via proxy header, got nil")
+		}
+	})
 }

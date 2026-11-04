@@ -287,11 +287,11 @@ export async function fetchPreviewState(): Promise<PreviewState> {
         return {
             active: {
                 target_host: "localhost",
-                target_port: 8080,
+                target_port: 3000,
                 scheme: "auto",
-                forwarder_port: 8080,
+                forwarder_port: 3000,
                 forwarder_active: false,
-                preview_url: "./preview/localhost:8080/",
+                preview_url: "./preview/localhost:3000/",
             },
             endpoints: DEFAULT_PREVIEW_ENDPOINTS,
         };

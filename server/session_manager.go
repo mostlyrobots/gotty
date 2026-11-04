@@ -18,6 +18,13 @@ import (
 // SessionID uniquely identifies a server-side terminal session (UUID v4).
 type SessionID string
 
+const (
+	// MaxSessionsPerUser bounds the number of concurrent sessions a single user can create.
+	MaxSessionsPerUser = 16
+	// MaxClientBufferSize bounds the unread byte buffer of an individual slow WebSocket client (4MB).
+	MaxClientBufferSize = 4 * 1024 * 1024
+)
+
 // SessionInfo is the JSON representation of an active session for the REST API.
 type SessionInfo struct {
 	ID              SessionID `json:"id"`
@@ -32,25 +39,84 @@ type SessionInfo struct {
 
 // Session represents a persistent server-side PTY/Container session with a circular replay buffer.
 type Session struct {
-	ID              SessionID                          `json:"id"`
-	Name            string                             `json:"name"`
-	Username        string                             `json:"username"`
-	Mode            string                             `json:"mode"`
-	UID             uint32                             `json:"uid"`
-	GID             uint32                             `json:"gid"`
-	HomeDir         string                             `json:"home_dir"`
-	IsHostAccess    bool                               `json:"is_host_access"`
-	ContainerID     string                             `json:"container_id"`
-	PTYMaster       Slave                              `json:"-"`
-	RingBuffer      *CircularBuffer                    `json:"-"`
-	AttachedClients map[*sessionClientSlave]struct{}   `json:"-"`
-	WSMutex         sync.RWMutex                       `json:"-"`
-	ReapTimer       *time.Timer                        `json:"-"`
-	ReapDuration    time.Duration                      `json:"-"`
-	CreatedAt       time.Time                          `json:"created_at"`
-	LastDetachedAt  time.Time                          `json:"last_detached_at"`
+	ID              SessionID                        `json:"id"`
+	Name            string                           `json:"name"`
+	Username        string                           `json:"username"`
+	Mode            string                           `json:"mode"`
+	UID             uint32                           `json:"uid"`
+	GID             uint32                           `json:"gid"`
+	HomeDir         string                           `json:"home_dir"`
+	IsHostAccess    bool                             `json:"is_host_access"`
+	ContainerID     string                           `json:"container_id"`
+	PTYMaster       Slave                            `json:"-"`
+	RingBuffer      *CircularBuffer                  `json:"-"`
+	AttachedClients map[*sessionClientSlave]struct{} `json:"-"`
+	WSMutex         sync.RWMutex                     `json:"-"`
+	ReapTimer       *time.Timer                      `json:"-"`
+	ReapDuration    time.Duration                    `json:"-"`
+	CreatedAt       time.Time                        `json:"created_at"`
+	LastDetachedAt  time.Time                        `json:"last_detached_at"`
 	closed          bool
 	onReap          func(SessionID)
+	oscStripper     oscRingStripper
+}
+
+// oscRingStripper filters transient OSC 7777 (godl download) and OSC 52 (clipboard write)
+// sequences out of the 1MB reconnect RingBuffer so page reloads do not re-trigger downloads
+// or evict terminal scrollback history, while live attached clients still receive them.
+type oscRingStripper struct {
+	suppressing bool
+	escInOSC    bool
+	prefix      []byte
+}
+
+var (
+	osc7777Prefix = []byte("\x1b]7777;")
+	osc52Prefix   = []byte("\x1b]52;")
+)
+
+func (o *oscRingStripper) Filter(chunk []byte) []byte {
+	var out []byte
+	for _, b := range chunk {
+		if o.suppressing {
+			if o.escInOSC {
+				o.escInOSC = false
+				if b == '\\' {
+					o.suppressing = false
+				} else if b == 0x1b {
+					o.escInOSC = true
+				}
+				continue
+			}
+			if b == 0x07 { // BEL terminates OSC
+				o.suppressing = false
+			} else if b == 0x1b {
+				o.escInOSC = true
+			}
+			continue
+		}
+
+		if len(o.prefix) > 0 || b == 0x1b {
+			o.prefix = append(o.prefix, b)
+			if bytes.Equal(o.prefix, osc7777Prefix) || bytes.Equal(o.prefix, osc52Prefix) {
+				o.prefix = o.prefix[:0]
+				o.suppressing = true
+				o.escInOSC = false
+				continue
+			}
+			if bytes.HasPrefix(osc7777Prefix, o.prefix) || bytes.HasPrefix(osc52Prefix, o.prefix) {
+				// Still matching prefix across chunk boundary
+				continue
+			}
+			// Not a matching OSC 7777/52 prefix: flush accumulated prefix bytes
+			out = append(out, o.prefix...)
+			o.prefix = o.prefix[:0]
+			continue
+		}
+
+		out = append(out, b)
+	}
+	return out
 }
 
 // SessionSpawner is a function that creates a new Slave for a given user, session ID, and mode.
@@ -114,6 +180,11 @@ func (sm *SessionManager) CreateSession(user *auth.UserIdentity, name string, mo
 		mode = "sandbox"
 	}
 
+	existingSessions := sm.ListSessions(user.Username)
+	if len(existingSessions) >= MaxSessionsPerUser {
+		return nil, fmt.Errorf("session limit reached (%d active sessions maximum per user)", MaxSessionsPerUser)
+	}
+
 	id := generateUUIDv4()
 	slave, err := sm.spawner(user, id, mode)
 	if err != nil {
@@ -121,7 +192,7 @@ func (sm *SessionManager) CreateSession(user *auth.UserIdentity, name string, mo
 	}
 
 	if name == "" {
-		count := len(sm.ListSessions(user.Username)) + 1
+		count := len(existingSessions) + 1
 		name = fmt.Sprintf("Session %d", count)
 	}
 
@@ -242,6 +313,44 @@ func (sm *SessionManager) DeleteSession(id SessionID, username string) error {
 	return nil
 }
 
+// CloseAll terminates all active sessions managed by the SessionManager during server shutdown.
+func (sm *SessionManager) CloseAll() {
+	sm.mu.RLock()
+	all := make([]*Session, 0, len(sm.sessions))
+	for _, s := range sm.sessions {
+		all = append(all, s)
+	}
+	sm.mu.RUnlock()
+
+	for _, s := range all {
+		s.Terminate()
+	}
+}
+
+// ResolveSandboxContainerPID finds an active sandboxed container session for username
+// and returns its container PID on the host (if any) and whether the user has an active container session.
+func (sm *SessionManager) ResolveSandboxContainerPID(username string) (int, bool) {
+	sm.mu.RLock()
+	var candidates []*Session
+	for _, s := range sm.sessions {
+		if username == "" || s.Username == username {
+			candidates = append(candidates, s)
+		}
+	}
+	sm.mu.RUnlock()
+
+	hasContainer := false
+	for _, s := range candidates {
+		if resolver, ok := s.PTYMaster.(ContainerPIDResolver); ok && resolver.IsSandboxedContainer() {
+			hasContainer = true
+			if pid, err := resolver.ResolveContainerPID(); err == nil && pid > 0 {
+				return pid, true
+			}
+		}
+	}
+	return 0, hasContainer
+}
+
 // Attach connects a new virtual Slave client to the session, replaying the circular buffer.
 func (sm *SessionManager) Attach(id SessionID, username string) (Slave, error) {
 	sess, err := sm.GetSession(id, username)
@@ -349,7 +458,9 @@ func (s *Session) readLoop() {
 		if n > 0 {
 			chunk := buf[:n]
 			s.WSMutex.Lock()
-			_, _ = s.RingBuffer.Write(chunk)
+			if filtered := s.oscStripper.Filter(chunk); len(filtered) > 0 {
+				_, _ = s.RingBuffer.Write(filtered)
+			}
 			for c := range s.AttachedClients {
 				c.push(chunk)
 			}
@@ -385,6 +496,18 @@ type sessionClientSlave struct {
 func (c *sessionClientSlave) push(data []byte) {
 	c.mu.Lock()
 	if !c.closed {
+		if c.buf.Len()+len(data) > MaxClientBufferSize {
+			// Drop oldest unread bytes so a slow client never causes unbounded OOM growth
+			excess := (c.buf.Len() + len(data)) - MaxClientBufferSize
+			if excess >= c.buf.Len() {
+				c.buf.Reset()
+				if len(data) > MaxClientBufferSize {
+					data = data[len(data)-MaxClientBufferSize:]
+				}
+			} else {
+				_ = c.buf.Next(excess)
+			}
+		}
 		_, _ = c.buf.Write(data)
 		c.cond.Signal()
 	}
